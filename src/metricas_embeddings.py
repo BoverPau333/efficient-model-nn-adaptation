@@ -26,12 +26,29 @@ def _asegurar_embeddings_labels(embeddings, labels):
 
 
 def _validar_metrica(metric: str) -> str:
-    """Restringe las metricas a las dos distancias que queremos comparar."""
+    """Restringe las metricas a las distancias soportadas."""
     metric = metric.lower()
-    validas = {"euclidean", "cosine"}
+    validas = {"euclidean", "cosine", "euclidean_normalized"}
     if metric not in validas:
         raise ValueError(f"Metrica no soportada: {metric}. Usa una de {sorted(validas)}")
     return metric
+
+
+def _normalizar_embeddings_l2(embeddings):
+    """Normaliza cada embedding a norma L2 unidad."""
+    embeddings = np.asarray(embeddings, dtype=float)
+    normas = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    if np.any(normas == 0.0):
+        raise ValueError("No se pueden normalizar embeddings con norma cero")
+    return embeddings / normas
+
+
+def _preparar_embeddings_y_metrica(embeddings, metric):
+    """Adapta embeddings y nombre de metrica para usar versiones normalizadas."""
+    metric = _validar_metrica(metric)
+    if metric == "euclidean_normalized":
+        return _normalizar_embeddings_l2(embeddings), "euclidean"
+    return embeddings, metric
 
 
 def _obtener_clases(labels):
@@ -59,9 +76,9 @@ def ratio_intra_inter_clase(embeddings, labels, metric="euclidean"):
     - inter-clase alta: clases mas alejadas entre si
     """
     embeddings, labels = _asegurar_embeddings_labels(embeddings, labels)
-    metric = _validar_metrica(metric)
+    embeddings, metric_real = _preparar_embeddings_y_metrica(embeddings, metric)
 
-    distancias = pairwise_distances(embeddings, metric=metric)
+    distancias = pairwise_distances(embeddings, metric=metric_real)
     misma_clase = labels[:, None] == labels[None, :]
     diagonal = np.eye(len(labels), dtype=bool)
 
@@ -97,10 +114,10 @@ def margen_a_centroides(embeddings, labels, metric="euclidean"):
     Si es negativo, es una muestra frontera o potencialmente mal situada.
     """
     embeddings, labels = _asegurar_embeddings_labels(embeddings, labels)
-    metric = _validar_metrica(metric)
+    embeddings, metric_real = _preparar_embeddings_y_metrica(embeddings, metric)
     clases, centroides = calcular_centroides(embeddings, labels)
 
-    distancias = pairwise_distances(embeddings, centroides, metric=metric)
+    distancias = pairwise_distances(embeddings, centroides, metric=metric_real)
     clase_a_indice = {clase: idx for idx, clase in enumerate(clases)}
     indices_correctos = np.array([clase_a_indice[label] for label in labels])
 
@@ -133,7 +150,7 @@ def knn_accuracy_embeddings(embeddings, labels, n_neighbors=5, metric="euclidean
     conjunto usado para entrenar el propio kNN.
     """
     embeddings, labels = _asegurar_embeddings_labels(embeddings, labels)
-    metric = _validar_metrica(metric)
+    embeddings, metric_real = _preparar_embeddings_y_metrica(embeddings, metric)
     clases, conteos = np.unique(labels, return_counts=True)
 
     if len(clases) < 2:
@@ -151,7 +168,7 @@ def knn_accuracy_embeddings(embeddings, labels, n_neighbors=5, metric="euclidean
     if n_neighbors < 1:
         n_neighbors = 1
 
-    clasificador = KNeighborsClassifier(n_neighbors=n_neighbors, metric=metric)
+    clasificador = KNeighborsClassifier(n_neighbors=n_neighbors, metric=metric_real)
     cv = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=42)
     scores = cross_val_score(clasificador, embeddings, labels, cv=cv, scoring="accuracy")
 
@@ -167,21 +184,21 @@ def knn_accuracy_embeddings(embeddings, labels, n_neighbors=5, metric="euclidean
 def silhouette_embeddings(embeddings, labels, metric="euclidean"):
     """Calcula silhouette score como medida global de separacion."""
     embeddings, labels = _asegurar_embeddings_labels(embeddings, labels)
-    metric = _validar_metrica(metric)
+    embeddings, metric_real = _preparar_embeddings_y_metrica(embeddings, metric)
 
     if len(np.unique(labels)) < 2:
         raise ValueError("Se necesitan al menos 2 clases para silhouette score")
 
-    valor = silhouette_score(embeddings, labels, metric=metric)
+    valor = silhouette_score(embeddings, labels, metric=metric_real)
     return float(valor)
 
 
 def matriz_distancias_centroides(embeddings, labels, metric="euclidean"):
     """Construye la matriz de distancias entre centroides de clase."""
     embeddings, labels = _asegurar_embeddings_labels(embeddings, labels)
-    metric = _validar_metrica(metric)
+    embeddings, metric_real = _preparar_embeddings_y_metrica(embeddings, metric)
     clases, centroides = calcular_centroides(embeddings, labels)
-    matriz = pairwise_distances(centroides, metric=metric)
+    matriz = pairwise_distances(centroides, metric=metric_real)
     return clases, matriz
 
 

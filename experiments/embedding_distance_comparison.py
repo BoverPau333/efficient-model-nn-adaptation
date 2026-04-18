@@ -19,7 +19,7 @@ from src.training import finetune
 from src.visualization import tensor_to_displayable_image
 
 
-EMBEDDING_DISTANCE_METRICS = ["euclidean", "cosine"]
+EMBEDDING_DISTANCE_METRICS = ["euclidean", "euclidean_normalized", "cosine"]
 TOP_K_CLASES_SIMILARES = 5
 NUM_EJEMPLOS_FRONTERA = 5
 
