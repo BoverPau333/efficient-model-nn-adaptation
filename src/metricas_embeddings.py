@@ -28,7 +28,7 @@ def _asegurar_embeddings_labels(embeddings, labels):
 def _validar_metrica(metric: str) -> str:
     """Restringe las metricas a las distancias soportadas."""
     metric = metric.lower()
-    validas = {"euclidean", "cosine", "euclidean_normalized"}
+    validas = {"euclidean", "sqeuclidean", "cosine", "euclidean_normalized"}
     if metric not in validas:
         raise ValueError(f"Metrica no soportada: {metric}. Usa una de {sorted(validas)}")
     return metric
@@ -168,7 +168,11 @@ def knn_accuracy_embeddings(embeddings, labels, n_neighbors=5, metric="euclidean
     if n_neighbors < 1:
         n_neighbors = 1
 
-    clasificador = KNeighborsClassifier(n_neighbors=n_neighbors, metric=metric_real)
+    clasificador = KNeighborsClassifier(
+        n_neighbors=n_neighbors,
+        metric=metric_real,
+        algorithm="brute",
+    )
     cv = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=42)
     scores = cross_val_score(clasificador, embeddings, labels, cv=cv, scoring="accuracy")
 
