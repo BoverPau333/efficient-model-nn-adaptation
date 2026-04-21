@@ -28,7 +28,7 @@ def _asegurar_embeddings_labels(embeddings, labels):
 def _validar_metrica(metric: str) -> str:
     """Restringe las metricas a las distancias soportadas."""
     metric = metric.lower()
-    validas = {"euclidean", "sqeuclidean", "cosine", "euclidean_normalized"}
+    validas = {"euclidean", "sqeuclidean", "cosine", "euclidean_normalized", "sqeuclidean_normalized"}
     if metric not in validas:
         raise ValueError(f"Metrica no soportada: {metric}. Usa una de {sorted(validas)}")
     return metric
@@ -48,6 +48,8 @@ def _preparar_embeddings_y_metrica(embeddings, metric):
     metric = _validar_metrica(metric)
     if metric == "euclidean_normalized":
         return _normalizar_embeddings_l2(embeddings), "euclidean"
+    if metric == "sqeuclidean_normalized":
+        return _normalizar_embeddings_l2(embeddings), "sqeuclidean"
     return embeddings, metric
 
 

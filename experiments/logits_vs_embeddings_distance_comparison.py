@@ -14,7 +14,12 @@ from src.models import MODEL_BUILDERS
 from src.training import evaluate, finetune
 
 
-DISTANCE_METRICS = ["euclidean", "sqeuclidean", "cosine"]
+DISTANCE_METRICS = [
+    "cosine",
+    "euclidean",
+    "euclidean_normalized",
+    "sqeuclidean_normalized",
+]
 REPRESENTATIONS = ("embeddings", "logits")
 
 
@@ -37,8 +42,9 @@ def _nombre_distancia(metric):
     """Devuelve un nombre legible para el CSV."""
     nombres = {
         "euclidean": "euclidean",
-        "sqeuclidean": "squared_euclidean",
         "cosine": "cosine",
+        "euclidean_normalized": "euclidean_l2_normalized",
+        "sqeuclidean_normalized": "squared_euclidean_l2_normalized",
     }
     return nombres[metric]
 
@@ -142,36 +148,47 @@ def _filas_comparacion(filas_resumen):
 
         fila_embeddings = grupo["embeddings"]
         fila_logits = grupo["logits"]
+        knn_advantage = fila_embeddings["knn_accuracy_mean"] - fila_logits["knn_accuracy_mean"]
+        silhouette_advantage = fila_embeddings["silhouette_score"] - fila_logits["silhouette_score"]
+        ratio_advantage = fila_logits["ratio_intra_inter"] - fila_embeddings["ratio_intra_inter"]
+        distance_confusion_corr_advantage = (
+            abs(fila_embeddings["distance_confusion_correlation"]) - abs(fila_logits["distance_confusion_correlation"])
+        )
+        mean_centroid_margin_advantage = (
+            fila_embeddings["mean_centroid_margin"] - fila_logits["mean_centroid_margin"]
+        )
+        negative_margin_fraction_advantage = (
+            fila_logits["negative_margin_fraction"] - fila_embeddings["negative_margin_fraction"]
+        )
+        metric_advantages = [
+            knn_advantage,
+            silhouette_advantage,
+            ratio_advantage,
+            distance_confusion_corr_advantage,
+            mean_centroid_margin_advantage,
+            negative_margin_fraction_advantage,
+        ]
+        n_metrics_won_by_embeddings = int(sum(valor > 0 for valor in metric_advantages))
+        n_metrics_won_by_logits = int(sum(valor < 0 for valor in metric_advantages))
 
         filas.append(
             {
                 "dataset": dataset_name,
                 "architecture": model_name,
                 "distance": distance,
-                "knn_accuracy_delta_embeddings_minus_logits": (
-                    fila_embeddings["knn_accuracy_mean"] - fila_logits["knn_accuracy_mean"]
-                ),
-                "silhouette_delta_embeddings_minus_logits": (
-                    fila_embeddings["silhouette_score"] - fila_logits["silhouette_score"]
-                ),
-                "ratio_intra_inter_delta_embeddings_minus_logits": (
-                    fila_embeddings["ratio_intra_inter"] - fila_logits["ratio_intra_inter"]
-                ),
-                "distance_confusion_corr_abs_delta_embeddings_minus_logits": (
-                    abs(fila_embeddings["distance_confusion_correlation"])
-                    - abs(fila_logits["distance_confusion_correlation"])
-                ),
-                "mean_centroid_margin_delta_embeddings_minus_logits": (
-                    fila_embeddings["mean_centroid_margin"] - fila_logits["mean_centroid_margin"]
-                ),
-                "negative_margin_fraction_delta_embeddings_minus_logits": (
-                    fila_embeddings["negative_margin_fraction"] - fila_logits["negative_margin_fraction"]
-                ),
+                "knn_accuracy_advantage_embeddings": knn_advantage,
+                "silhouette_advantage_embeddings": silhouette_advantage,
+                "ratio_intra_inter_advantage_embeddings": ratio_advantage,
+                "distance_confusion_corr_abs_advantage_embeddings": distance_confusion_corr_advantage,
+                "mean_centroid_margin_advantage_embeddings": mean_centroid_margin_advantage,
+                "negative_margin_fraction_advantage_embeddings": negative_margin_fraction_advantage,
                 "better_representation_by_mean_rank": min(
                     (fila_embeddings["representation"], fila_embeddings["mean_rank"]),
                     (fila_logits["representation"], fila_logits["mean_rank"]),
                     key=lambda item: item[1],
                 )[0],
+                "n_metrics_won_by_embeddings": n_metrics_won_by_embeddings,
+                "n_metrics_won_by_logits": n_metrics_won_by_logits,
             }
         )
 
