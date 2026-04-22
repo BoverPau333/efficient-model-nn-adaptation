@@ -35,7 +35,7 @@ Outputs
 import time
 from torch.utils.data import DataLoader
 
-from src.config import BATCH_SIZE, DEVICE, NUM_WORKERS, PLOTS_DIR, RESULTS_DIR, RETENTION_FRACTIONS
+from src.experiments_config.config import BATCH_SIZE, DEVICE, NUM_WORKERS, PLOTS_DIR, RESULTS_DIR, RETENTION_FRACTIONS
 from src.dataset.loaders import DATASET_LOADERS
 from src.dataset.utils import count_examples_per_class
 from src.models import build_mobilenet

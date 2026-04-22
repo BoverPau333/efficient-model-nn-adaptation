@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from src.config import SEED
+from src.experiments_config.config import SEED
 
 
 def write_csv(path: str, rows: list, fieldnames: list):

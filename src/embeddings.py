@@ -3,7 +3,7 @@
 import numpy as np
 import torch
 
-from src.config import DEVICE
+from src.experiments_config.config import DEVICE
 
 
 def extraer_embeddings_y_logits(model, loader):

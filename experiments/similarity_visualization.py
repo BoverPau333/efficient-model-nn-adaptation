@@ -1,6 +1,6 @@
 from torch.utils.data import DataLoader
 
-from src.config import BATCH_SIZE, DEVICE, NUM_WORKERS, PLOTS_DIR
+from src.experiments_config.config import BATCH_SIZE, DEVICE, NUM_WORKERS, PLOTS_DIR
 from src.dataset.loaders import DATASET_LOADERS
 from src.models import build_mobilenet
 from src.training import evaluate, finetune

@@ -6,7 +6,7 @@ import torchvision
 import torchvision.transforms as transforms
 from torchvision.datasets import ImageFolder
 
-from src.config import DATA_DIR
+from src.experiments_config.config import DATA_DIR
 from src.dataset.utils import split_train_val
 
 

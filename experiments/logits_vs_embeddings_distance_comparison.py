@@ -6,7 +6,7 @@ import numpy as np
 from sklearn.metrics import confusion_matrix as sk_confusion_matrix
 from torch.utils.data import DataLoader
 
-from src.config import BATCH_SIZE, NUM_WORKERS, RESULTS_DIR
+from src.experiments_config.config import BATCH_SIZE, NUM_WORKERS, RESULTS_DIR
 from src.dataset.loaders import DATASET_LOADERS
 from src.embeddings import extraer_embeddings_y_logits
 from src.metricas_embeddings import evaluar_metricas_embeddings

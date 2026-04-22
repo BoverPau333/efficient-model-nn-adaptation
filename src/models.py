@@ -11,7 +11,7 @@ from torchvision.models import (
     resnet18,
 )
 
-from src.config import DEVICE
+from src.experiments_config.config import DEVICE
 
 
 def _congelar_backbone(model):

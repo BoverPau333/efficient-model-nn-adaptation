@@ -3,7 +3,7 @@
 import numpy as np
 from torch.utils.data import Subset
 
-from src.config import SEED
+from src.experiments_config.config import SEED
 
 
 def reduce_all_classes(dataset, fraction: float, seed: int = SEED) -> Subset:
