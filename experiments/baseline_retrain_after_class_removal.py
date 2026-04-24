@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from src.experiments_config.class_removal_baseline_config import (
@@ -20,6 +21,7 @@ from src.experiments_config.class_removal_baseline_config import (
 from src.experiments_config.config import BATCH_SIZE, LR, NUM_WORKERS, RESULTS_DIR, SEED
 from src.dataset.loaders import DATASET_LOADERS
 from src.dataset.utils import count_examples_per_class, remove_class_and_remap
+from src.metrics_elimination import METRICAS_ELIMINACION
 from src.models import MODEL_BUILDERS
 from src.training import evaluate, train_with_early_stopping
 
@@ -38,6 +40,11 @@ def parse_args():
         default=DEFAULT_DATASET,
         choices=sorted(DATASET_LOADERS),
         help="Dataset to run the baseline on.",
+    )
+    parser.add_argument(
+        "--all-datasets",
+        action="store_true",
+        help="Run the baseline on every registered dataset in one execution.",
     )
     parser.add_argument(
         "--models",
@@ -192,6 +199,73 @@ def build_loader(dataset, batch_size: int, shuffle: bool, num_workers: int, seed
     )
 
 
+def count_trainable_parameters(model) -> int:
+    """Count how many parameters are updated during training."""
+    return sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+
+
+def evaluate_prediction_confidence(model, loader) -> float:
+    """Compute the mean max-softmax confidence over a dataloader."""
+    model.eval()
+    confidences = []
+
+    with torch.no_grad():
+        for imgs, _ in loader:
+            imgs = imgs.to(next(model.parameters()).device)
+            probs = F.softmax(model(imgs), dim=1)
+            batch_confidence = probs.max(dim=1).values
+            confidences.extend(batch_confidence.cpu().numpy().tolist())
+
+    if not confidences:
+        return 0.0
+    return float(np.mean(confidences))
+
+
+def total_examples_from_split_counts(split_counts: dict, split_name: str = "train") -> int:
+    """Return the total number of examples used for a given split."""
+    return int(sum(split_counts.get(split_name, {}).values()))
+
+
+def derive_summary_metrics(metrics_payload=None):
+    """Project experiment outputs onto the elimination-metrics summary schema."""
+    if metrics_payload is None:
+        return {}
+
+    per_class_accuracy = metrics_payload.get("test_per_class_accuracy", {})
+    forgetting_value = metrics_payload.get("forgetting_u_olvido")
+    metrics = {
+        "tiempo_total_de_adaptacion": float(metrics_payload["elapsed_seconds"]),
+        "accuracy_global": float(metrics_payload["test_overall_accuracy"]),
+        "accuracy_por_clase": json.dumps(per_class_accuracy, ensure_ascii=True, sort_keys=True),
+        "accuracy_en_clases_restantes": float(metrics_payload["test_mean_per_class_accuracy"]),
+        "forgetting_u_olvido": None if forgetting_value is None else float(forgetting_value),
+        "numero_de_ejemplos_utilizados": int(
+            metrics_payload["num_examples_used_for_adaptation"]
+        ),
+        "confianza_de_prediccion": float(metrics_payload["prediction_confidence_mean"]),
+        "numero_de_parametros_entrenados_o_modificados": int(
+            metrics_payload["num_trainable_parameters"]
+        ),
+        "memoria_adicional_requerida": float(metrics_payload["additional_memory_required"]),
+    }
+    metrics.update(
+        {
+            "Tiempo total de adaptacion": metrics["tiempo_total_de_adaptacion"],
+            "Accuracy global": metrics["accuracy_global"],
+            "Accuracy por clase": metrics["accuracy_por_clase"],
+            "Accuracy en clases restantes": metrics["accuracy_en_clases_restantes"],
+            "Forgetting u olvido": metrics["forgetting_u_olvido"],
+            "Numero de ejemplos utilizados": metrics["numero_de_ejemplos_utilizados"],
+            "Confianza de prediccion": metrics["confianza_de_prediccion"],
+            "Numero de parametros entrenados o modificados": (
+                metrics["numero_de_parametros_entrenados_o_modificados"]
+            ),
+            "Memoria adicional requerida": metrics["memoria_adicional_requerida"],
+        }
+    )
+    return metrics
+
+
 def build_summary_row(
     dataset_name: str,
     model_name: str,
@@ -211,6 +285,7 @@ def build_summary_row(
     }
 
     if metrics_payload is not None:
+        derived_metrics = derive_summary_metrics(metrics_payload)
         row.update(
             {
                 "best_epoch": int(metrics_payload["best_epoch"]),
@@ -222,6 +297,7 @@ def build_summary_row(
                 "elapsed_seconds": float(metrics_payload["elapsed_seconds"]),
             }
         )
+        row.update(derived_metrics)
 
     if error_message is not None:
         row["error"] = error_message
@@ -241,7 +317,14 @@ def load_existing_summary(metrics_path: Path):
     existing_metrics = load_json(metrics_path)
     summary = existing_metrics.get("summary")
     if summary is None:
-        raise ValueError(f"Missing 'summary' field in existing metrics file: {metrics_path}")
+        summary = build_summary_row(
+            dataset_name=existing_metrics["dataset"],
+            model_name=existing_metrics["model_name"],
+            removed_class_name=existing_metrics["removed_class"],
+            final_num_classes=existing_metrics["final_num_classes"],
+            status="completed",
+            metrics_payload=existing_metrics,
+        )
     summary["status"] = "skipped_existing"
     return summary
 
@@ -273,11 +356,10 @@ def run_single_experiment(
         / slugify(model_name)
         / f"removed_{slugify(removed_class_name)}"
     )
-    checkpoint_path = experiment_dir / "best_model.pt"
     metrics_path = experiment_dir / "final_metrics.json"
     error_path = experiment_dir / "error.json"
 
-    if not args.overwrite and checkpoint_path.exists() and metrics_path.exists():
+    if not args.overwrite and metrics_path.exists():
         print(f"[SKIP] {dataset_name} | {model_name} | remove={removed_class_name}")
         return load_existing_summary(metrics_path)
 
@@ -296,6 +378,7 @@ def run_single_experiment(
 
     num_classes = len(filtered_classes)
     model = model_builder(num_classes)
+    num_trainable_parameters = count_trainable_parameters(model)
 
     t0 = time.time()
     training_result = train_with_early_stopping(
@@ -305,7 +388,7 @@ def run_single_experiment(
         epochs=args.epochs,
         lr=args.lr,
         patience=args.patience,
-        checkpoint_path=checkpoint_path,
+        checkpoint_path=None,
         verbose=True,
     )
     elapsed = time.time() - t0
@@ -317,6 +400,7 @@ def run_single_experiment(
     )
 
     split_counts = aggregate_counts(filtered_train, filtered_val, filtered_test, filtered_classes)
+    prediction_confidence_mean = evaluate_prediction_confidence(model, test_loader)
     metrics_payload = {
         "dataset": dataset_name,
         "model_name": model_name,
@@ -343,7 +427,13 @@ def run_single_experiment(
         "confusion_matrix": confusion_matrix.tolist(),
         "class_names": list(filtered_classes),
         "examples_per_split": split_counts,
-        "checkpoint_path": str(checkpoint_path),
+        "num_examples_used_for_adaptation": total_examples_from_split_counts(split_counts, "train"),
+        "prediction_confidence_mean": float(prediction_confidence_mean),
+        "num_trainable_parameters": int(num_trainable_parameters),
+        "additional_memory_required": 0.0,
+        "forgetting_u_olvido": None,
+        "metricas_eliminacion": [metrica.nombre for metrica in METRICAS_ELIMINACION],
+        "stores_model_checkpoint": False,
     }
     metrics_payload["summary"] = build_summary_row(
         dataset_name=dataset_name,
@@ -359,100 +449,127 @@ def run_single_experiment(
 
 
 def run_all_experiments(args):
-    """Run the complete class-removal baseline for one dataset."""
-    if args.dataset not in DATASET_LOADERS:
+    """Run the complete class-removal baseline for one or all datasets."""
+    dataset_names = sorted(DATASET_LOADERS) if args.all_datasets else [args.dataset]
+    if not args.all_datasets and args.dataset not in DATASET_LOADERS:
         raise ValueError(f"Unknown dataset '{args.dataset}'. Available: {sorted(DATASET_LOADERS)}")
 
     selected_models = {model_name: MODEL_BUILDERS[model_name] for model_name in args.models}
-    classes_to_remove = get_classes_to_remove(args.dataset, args.classes)
+    all_summary_rows = []
+    base_output_dir = Path(args.output_dir)
 
-    print(f"Dataset selected: {args.dataset}")
+    print(f"Datasets selected: {dataset_names}")
     print(f"Models selected: {list(selected_models)}")
-    print(f"Classes to remove: {classes_to_remove}")
-    print(f"Selection metric for best checkpoint: validation loss")
+    print("Selection metric for best checkpoint: validation loss")
 
-    train_ds, val_ds, test_ds, original_classes = DATASET_LOADERS[args.dataset]()
-    dataset_output_dir = Path(args.output_dir) / slugify(args.dataset)
-    dataset_output_dir.mkdir(parents=True, exist_ok=True)
+    for dataset_name in dataset_names:
+        print(f"\nRunning dataset: {dataset_name}")
+        dataset_output_dir = base_output_dir / slugify(dataset_name)
+        dataset_output_dir.mkdir(parents=True, exist_ok=True)
+        summary_rows = []
 
-    summary_rows = []
-    for class_to_remove in classes_to_remove:
         try:
-            filtered_train, metadata = remove_class_and_remap(train_ds, original_classes, class_to_remove)
-            filtered_val, _ = remove_class_and_remap(val_ds, original_classes, class_to_remove)
-            filtered_test, _ = remove_class_and_remap(test_ds, original_classes, class_to_remove)
+            train_ds, val_ds, test_ds, original_classes = DATASET_LOADERS[dataset_name]()
+            classes_to_remove = get_classes_to_remove(dataset_name, args.classes)
+            print(f"Classes to remove: {classes_to_remove}")
         except Exception as exc:
             error_message = str(exc)
-            print(f"[ERROR] Could not prepare class removal '{class_to_remove}': {error_message}")
-            for model_name in selected_models:
-                summary_rows.append(
-                    build_summary_row(
-                        dataset_name=args.dataset,
-                        model_name=model_name,
-                        removed_class_name=class_to_remove,
-                        final_num_classes=max(len(original_classes) - 1, 0),
-                        status="failed",
-                        error_message=error_message,
-                    )
-                )
+            print(f"[ERROR] Could not initialize dataset '{dataset_name}': {error_message}")
+            summary_rows.append(
+                {
+                    "dataset": dataset_name,
+                    "status": "failed_dataset_setup",
+                    "error": error_message,
+                }
+            )
             save_json(dataset_output_dir / "experiments_summary.json", summary_rows)
             write_csv(dataset_output_dir / "experiments_summary.csv", summary_rows)
+            all_summary_rows.extend(summary_rows)
             continue
 
-        removed_class_name = metadata["removed_class_name"]
-        filtered_classes = metadata["remaining_classes"]
-
-        for model_name, model_builder in selected_models.items():
+        for class_to_remove in classes_to_remove:
             try:
-                summary_row = run_single_experiment(
-                    dataset_name=args.dataset,
-                    model_name=model_name,
-                    model_builder=model_builder,
-                    removed_class_name=removed_class_name,
-                    filtered_train=filtered_train,
-                    filtered_val=filtered_val,
-                    filtered_test=filtered_test,
-                    filtered_classes=filtered_classes,
-                    args=args,
-                    dataset_output_dir=dataset_output_dir,
-                )
-                summary_rows.append(summary_row)
+                filtered_train, metadata = remove_class_and_remap(train_ds, original_classes, class_to_remove)
+                filtered_val, _ = remove_class_and_remap(val_ds, original_classes, class_to_remove)
+                filtered_test, _ = remove_class_and_remap(test_ds, original_classes, class_to_remove)
             except Exception as exc:
                 error_message = str(exc)
-                experiment_dir = (
-                    dataset_output_dir
-                    / slugify(model_name)
-                    / f"removed_{slugify(removed_class_name)}"
-                )
-                save_json(
-                    experiment_dir / "error.json",
-                    {
-                        "dataset": args.dataset,
-                        "model_name": model_name,
-                        "removed_class": removed_class_name,
-                        "error": error_message,
-                        "traceback": traceback.format_exc(),
-                    },
-                )
-                print(f"[ERROR] {args.dataset} | {model_name} | remove={removed_class_name}: {error_message}")
-                summary_rows.append(
-                    build_summary_row(
-                        dataset_name=args.dataset,
-                        model_name=model_name,
-                        removed_class_name=removed_class_name,
-                        final_num_classes=len(filtered_classes),
-                        status="failed",
-                        error_message=error_message,
+                print(f"[ERROR] Could not prepare class removal '{class_to_remove}': {error_message}")
+                for model_name in selected_models:
+                    summary_rows.append(
+                        build_summary_row(
+                            dataset_name=dataset_name,
+                            model_name=model_name,
+                            removed_class_name=class_to_remove,
+                            final_num_classes=max(len(original_classes) - 1, 0),
+                            status="failed",
+                            error_message=error_message,
+                        )
                     )
-                )
+                save_json(dataset_output_dir / "experiments_summary.json", summary_rows)
+                write_csv(dataset_output_dir / "experiments_summary.csv", summary_rows)
+                continue
 
-            save_json(dataset_output_dir / "experiments_summary.json", summary_rows)
-            write_csv(dataset_output_dir / "experiments_summary.csv", summary_rows)
+            removed_class_name = metadata["removed_class_name"]
+            filtered_classes = metadata["remaining_classes"]
 
-    save_json(dataset_output_dir / "experiments_summary.json", summary_rows)
-    write_csv(dataset_output_dir / "experiments_summary.csv", summary_rows)
+            for model_name, model_builder in selected_models.items():
+                try:
+                    summary_row = run_single_experiment(
+                        dataset_name=dataset_name,
+                        model_name=model_name,
+                        model_builder=model_builder,
+                        removed_class_name=removed_class_name,
+                        filtered_train=filtered_train,
+                        filtered_val=filtered_val,
+                        filtered_test=filtered_test,
+                        filtered_classes=filtered_classes,
+                        args=args,
+                        dataset_output_dir=dataset_output_dir,
+                    )
+                    summary_rows.append(summary_row)
+                except Exception as exc:
+                    error_message = str(exc)
+                    experiment_dir = (
+                        dataset_output_dir
+                        / slugify(model_name)
+                        / f"removed_{slugify(removed_class_name)}"
+                    )
+                    save_json(
+                        experiment_dir / "error.json",
+                        {
+                            "dataset": dataset_name,
+                            "model_name": model_name,
+                            "removed_class": removed_class_name,
+                            "error": error_message,
+                            "traceback": traceback.format_exc(),
+                        },
+                    )
+                    print(f"[ERROR] {dataset_name} | {model_name} | remove={removed_class_name}: {error_message}")
+                    summary_rows.append(
+                        build_summary_row(
+                            dataset_name=dataset_name,
+                            model_name=model_name,
+                            removed_class_name=removed_class_name,
+                            final_num_classes=len(filtered_classes),
+                            status="failed",
+                            error_message=error_message,
+                        )
+                    )
+
+                save_json(dataset_output_dir / "experiments_summary.json", summary_rows)
+                write_csv(dataset_output_dir / "experiments_summary.csv", summary_rows)
+
+        save_json(dataset_output_dir / "experiments_summary.json", summary_rows)
+        write_csv(dataset_output_dir / "experiments_summary.csv", summary_rows)
+        all_summary_rows.extend(summary_rows)
+
+    if all_summary_rows:
+        save_json(base_output_dir / "experiments_summary.json", all_summary_rows)
+        write_csv(base_output_dir / "experiments_summary.csv", all_summary_rows)
+
     print("\nBaseline completed.")
-    print(f"Results saved under: {dataset_output_dir}")
+    print(f"Results saved under: {base_output_dir}")
 
 
 if __name__ == "__main__":
