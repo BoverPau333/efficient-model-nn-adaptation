@@ -13,6 +13,6 @@ ENV_PY="/mnt/homeGPU/pbovera/envs/tfg/bin/python"
 "$ENV_PY" -V
 "$ENV_PY" -c "import torch; print(torch.__version__); print(torch.cuda.is_available())"
 
-"$ENV_PY" -m experiments.baseline_retrain_after_class_removal --all-datasets
+"$ENV_PY" -m experiments.baseline_retrain_after_class_removal --all-datasets --overwrite
 
 mail -s "tfg_train finalizado" pauboverfemenias@gmail.com <<< "baseline_retrain_after_class_removal.py ha terminado"

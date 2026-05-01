@@ -1,4 +1,4 @@
-"""Shared configuration values for experiments."""
+"""Configuracion compartida para los experimentos"""
 
 from pathlib import Path
 

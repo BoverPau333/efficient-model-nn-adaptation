@@ -33,5 +33,21 @@ tmp/
 temp/
 *.tmp
 
+# LaTeX build files
+latex/*.aux
+latex/*.bbl
+latex/*.bcf
+latex/*.blg
+latex/*.fdb_latexmk
+latex/*.fls
+latex/*.lof
+latex/*.log
+latex/*.lot
+latex/*.out
+latex/*.run.xml
+latex/*.synctex.gz
+latex/*.toc
+latex/build/
+latex/*
 
 .codex

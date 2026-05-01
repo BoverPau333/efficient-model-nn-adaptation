@@ -55,6 +55,8 @@ def _forward_embeddings_logits_efficientnet(model, imgs):
 def build_mobilenet(num_classes: int) -> nn.Module:
     """Construye un MobileNetV3-Small desde cero con todos los parametros entrenables."""
     model = mobilenet_v3_small(weights=None)
+    for parameter in model.parameters():
+        parameter.requires_grad = True
     in_features = model.classifier[3].in_features
     model.classifier[3] = nn.Linear(in_features, num_classes)
     model.forward_embeddings_and_logits = lambda imgs: _forward_embeddings_logits_mobilenet(model, imgs)
@@ -75,6 +77,8 @@ def build_mobilenet_imagenet(num_classes: int) -> nn.Module:
 def build_resnet18(num_classes: int) -> nn.Module:
     """Construye un ResNet18 desde cero con todos los parametros entrenables."""
     model = resnet18(weights=None)
+    for parameter in model.parameters():
+        parameter.requires_grad = True
     in_features = model.fc.in_features
     model.fc = nn.Linear(in_features, num_classes)
     model.forward_embeddings_and_logits = lambda imgs: _forward_embeddings_logits_resnet(model, imgs)
@@ -95,6 +99,8 @@ def build_resnet18_imagenet(num_classes: int) -> nn.Module:
 def build_efficientnet_b0(num_classes: int) -> nn.Module:
     """Construye un EfficientNet-B0 desde cero con todos los parametros entrenables."""
     model = efficientnet_b0(weights=None)
+    for parameter in model.parameters():
+        parameter.requires_grad = True
     in_features = model.classifier[1].in_features
     model.classifier[1] = nn.Linear(in_features, num_classes)
     model.forward_embeddings_and_logits = lambda imgs: _forward_embeddings_logits_efficientnet(model, imgs)

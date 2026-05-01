@@ -28,6 +28,7 @@ from src.training import evaluate, train_with_early_stopping
 
 DEFAULT_MAX_EPOCHS = 40
 DEFAULT_PATIENCE = 5
+DEFAULT_REFERENCE_OUTPUT_DIR = RESULTS_DIR / "full_training_reference_imagenet"
 
 
 def parse_args():
@@ -99,6 +100,14 @@ def parse_args():
         "--output-dir",
         default=str(RESULTS_DIR / "class_removal_baseline"),
         help="Base output directory for checkpoints, logs and summaries.",
+    )
+    parser.add_argument(
+        "--reference-dir",
+        default=str(DEFAULT_REFERENCE_OUTPUT_DIR),
+        help=(
+            "Directory containing the full-class ImageNet reference runs used "
+            "to compute forgetting on the remaining classes."
+        ),
     )
     parser.add_argument(
         "--overwrite",
@@ -226,6 +235,48 @@ def total_examples_from_split_counts(split_counts: dict, split_name: str = "trai
     return int(sum(split_counts.get(split_name, {}).values()))
 
 
+def load_reference_metrics(reference_dir: Path, dataset_name: str, model_name: str):
+    """Load the full-class ImageNet reference metrics for one dataset/model pair."""
+    metrics_path = reference_dir / slugify(dataset_name) / slugify(model_name) / "final_metrics.json"
+    if not metrics_path.exists():
+        raise FileNotFoundError(
+            "Missing full-training ImageNet reference metrics at "
+            f"'{metrics_path}'. Run experiments/full_training_reference_imagenet.py first "
+            "or pass --reference-dir with the correct location."
+        )
+
+    metrics_payload = load_json(metrics_path)
+    per_class_accuracy = metrics_payload.get("test_per_class_accuracy")
+    if not isinstance(per_class_accuracy, dict) or not per_class_accuracy:
+        raise ValueError(
+            f"Reference metrics at '{metrics_path}' do not contain a valid "
+            "'test_per_class_accuracy' mapping."
+        )
+    return metrics_payload, metrics_path
+
+
+def compute_forgetting_from_reference(reference_per_class_accuracy: dict, current_per_class_accuracy: dict) -> float:
+    """Average how much the remaining classes worsen versus the full-class reference."""
+    remaining_classes = list(current_per_class_accuracy)
+    if not remaining_classes:
+        raise ValueError("Cannot compute forgetting without remaining classes.")
+
+    missing_classes = [
+        class_name for class_name in remaining_classes if class_name not in reference_per_class_accuracy
+    ]
+    if missing_classes:
+        raise ValueError(
+            "The ImageNet reference is missing remaining classes required for forgetting: "
+            f"{missing_classes}"
+        )
+
+    degradations = [
+        float(reference_per_class_accuracy[class_name]) - float(current_per_class_accuracy[class_name])
+        for class_name in remaining_classes
+    ]
+    return float(np.mean(degradations))
+
+
 def derive_summary_metrics(metrics_payload=None):
     """Project experiment outputs onto the elimination-metrics summary schema."""
     if metrics_payload is None:
@@ -233,10 +284,18 @@ def derive_summary_metrics(metrics_payload=None):
 
     per_class_accuracy = metrics_payload.get("test_per_class_accuracy", {})
     forgetting_value = metrics_payload.get("forgetting_u_olvido")
+    if isinstance(per_class_accuracy, str):
+        serialized_per_class_accuracy = per_class_accuracy
+    else:
+        serialized_per_class_accuracy = json.dumps(
+            per_class_accuracy,
+            ensure_ascii=True,
+            sort_keys=True,
+        )
     metrics = {
         "tiempo_total_de_adaptacion": float(metrics_payload["elapsed_seconds"]),
         "accuracy_global": float(metrics_payload["test_overall_accuracy"]),
-        "accuracy_por_clase": json.dumps(per_class_accuracy, ensure_ascii=True, sort_keys=True),
+        "accuracy_por_clase": serialized_per_class_accuracy,
         "accuracy_en_clases_restantes": float(metrics_payload["test_mean_per_class_accuracy"]),
         "forgetting_u_olvido": None if forgetting_value is None else float(forgetting_value),
         "numero_de_ejemplos_utilizados": int(
@@ -367,6 +426,12 @@ def run_single_experiment(
     if error_path.exists():
         error_path.unlink()
 
+    reference_metrics, reference_metrics_path = load_reference_metrics(
+        reference_dir=Path(args.reference_dir),
+        dataset_name=dataset_name,
+        model_name=model_name,
+    )
+
     set_seed(args.seed)
     train_loader = build_loader(filtered_train, args.batch_size, True, args.num_workers, args.seed)
     val_loader = build_loader(filtered_val, args.batch_size, False, args.num_workers, args.seed)
@@ -401,6 +466,14 @@ def run_single_experiment(
 
     split_counts = aggregate_counts(filtered_train, filtered_val, filtered_test, filtered_classes)
     prediction_confidence_mean = evaluate_prediction_confidence(model, test_loader)
+    test_per_class_accuracy = {
+        class_name: float(per_class_accuracy[class_idx])
+        for class_idx, class_name in enumerate(filtered_classes)
+    }
+    forgetting_value = compute_forgetting_from_reference(
+        reference_per_class_accuracy=reference_metrics["test_per_class_accuracy"],
+        current_per_class_accuracy=test_per_class_accuracy,
+    )
     metrics_payload = {
         "dataset": dataset_name,
         "model_name": model_name,
@@ -420,10 +493,7 @@ def run_single_experiment(
         "elapsed_seconds": float(elapsed),
         "test_overall_accuracy": float(test_overall_accuracy),
         "test_mean_per_class_accuracy": float(np.mean(per_class_accuracy)),
-        "test_per_class_accuracy": {
-            class_name: float(per_class_accuracy[class_idx])
-            for class_idx, class_name in enumerate(filtered_classes)
-        },
+        "test_per_class_accuracy": test_per_class_accuracy,
         "confusion_matrix": confusion_matrix.tolist(),
         "class_names": list(filtered_classes),
         "examples_per_split": split_counts,
@@ -431,7 +501,9 @@ def run_single_experiment(
         "prediction_confidence_mean": float(prediction_confidence_mean),
         "num_trainable_parameters": int(num_trainable_parameters),
         "additional_memory_required": 0.0,
-        "forgetting_u_olvido": None,
+        "forgetting_u_olvido": float(forgetting_value),
+        "forgetting_reference_source": "full_training_reference_imagenet",
+        "forgetting_reference_metrics_path": str(reference_metrics_path),
         "metricas_eliminacion": [metrica.nombre for metrica in METRICAS_ELIMINACION],
         "stores_model_checkpoint": False,
     }
