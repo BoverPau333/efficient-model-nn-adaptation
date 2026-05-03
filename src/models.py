@@ -118,6 +118,48 @@ def build_efficientnet_b0_imagenet(num_classes: int) -> nn.Module:
     return model.to(DEVICE)
 
 
+def build_mobilenet_imagenet_frozen_backbone(num_classes: int) -> nn.Module:
+    """Construye un MobileNetV3-Small con backbone congelado y solo la cabecera entrenable."""
+    model = mobilenet_v3_small(weights=MobileNet_V3_Small_Weights.DEFAULT)
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+    in_features = model.classifier[3].in_features
+    model.classifier[3] = nn.Linear(in_features, num_classes)
+    for parameter in model.classifier.parameters():
+        parameter.requires_grad = True
+    model.forward_embeddings_and_logits = lambda imgs: _forward_embeddings_logits_mobilenet(model, imgs)
+    model.embedding_dim = in_features
+    return model.to(DEVICE)
+
+
+def build_resnet18_imagenet_frozen_backbone(num_classes: int) -> nn.Module:
+    """Construye un ResNet18 con backbone congelado y solo la cabecera entrenable."""
+    model = resnet18(weights=ResNet18_Weights.DEFAULT)
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+    in_features = model.fc.in_features
+    model.fc = nn.Linear(in_features, num_classes)
+    for parameter in model.fc.parameters():
+        parameter.requires_grad = True
+    model.forward_embeddings_and_logits = lambda imgs: _forward_embeddings_logits_resnet(model, imgs)
+    model.embedding_dim = in_features
+    return model.to(DEVICE)
+
+
+def build_efficientnet_b0_imagenet_frozen_backbone(num_classes: int) -> nn.Module:
+    """Construye un EfficientNet-B0 con backbone congelado y solo la cabecera entrenable."""
+    model = efficientnet_b0(weights=EfficientNet_B0_Weights.DEFAULT)
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+    in_features = model.classifier[1].in_features
+    model.classifier[1] = nn.Linear(in_features, num_classes)
+    for parameter in model.classifier.parameters():
+        parameter.requires_grad = True
+    model.forward_embeddings_and_logits = lambda imgs: _forward_embeddings_logits_efficientnet(model, imgs)
+    model.embedding_dim = in_features
+    return model.to(DEVICE)
+
+
 MODEL_BUILDERS = {
     "MobileNetV3-Small": build_mobilenet,
     "ResNet18": build_resnet18,
@@ -129,4 +171,11 @@ IMAGENET_MODEL_BUILDERS = {
     "MobileNetV3-Small": build_mobilenet_imagenet,
     "ResNet18": build_resnet18_imagenet,
     "EfficientNet-B0": build_efficientnet_b0_imagenet,
+}
+
+
+IMAGENET_FROZEN_HEAD_MODEL_BUILDERS = {
+    "MobileNetV3-Small": build_mobilenet_imagenet_frozen_backbone,
+    "ResNet18": build_resnet18_imagenet_frozen_backbone,
+    "EfficientNet-B0": build_efficientnet_b0_imagenet_frozen_backbone,
 }

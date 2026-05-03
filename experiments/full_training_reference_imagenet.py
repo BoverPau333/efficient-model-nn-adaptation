@@ -203,32 +203,51 @@ def total_examples_from_split_counts(split_counts: dict, split_name: str = "trai
     return int(sum(split_counts.get(split_name, {}).values()))
 
 
+def derive_summary_metrics(metrics_payload=None):
+    """Project reference-training outputs onto the baseline summary schema."""
+    if metrics_payload is None:
+        return {}
+
+    epochs_ran = int(metrics_payload["epochs_ran"])
+    elapsed_seconds = float(metrics_payload["elapsed_seconds"])
+    return {
+        "tiempo_total_de_adaptacion": elapsed_seconds,
+        "tiempo_por_epoca": elapsed_seconds / max(epochs_ran, 1),
+        "accuracy_global": float(metrics_payload["test_overall_accuracy"]),
+        "accuracy_en_clases_restantes": float(metrics_payload["test_mean_per_class_accuracy"]),
+        "forgetting_u_olvido": None,
+        "numero_de_ejemplos_utilizados": int(metrics_payload["num_examples_used_for_adaptation"]),
+        "confianza_de_prediccion": float(metrics_payload["prediction_confidence_mean"]),
+        "numero_de_parametros_entrenados_o_modificados": int(
+            metrics_payload["num_trainable_parameters"]
+        ),
+        "memoria_adicional_requerida": float(metrics_payload["additional_memory_required"]),
+    }
+
+
 def build_summary_row(dataset_name: str, model_name: str, status: str, metrics_payload=None, error_message=None):
     """Flatten the most useful fields for the aggregate CSV/JSON summary."""
     row = {
         "dataset": dataset_name,
         "model_name": model_name,
-        "training_scope": "all_classes",
-        "initialization": "imagenet",
+        "removed_class": "__all__",
+        "final_num_classes": None,
         "status": status,
     }
 
     if metrics_payload is not None:
+        derived_metrics = derive_summary_metrics(metrics_payload)
         row.update(
             {
+                "removed_class": "__all__",
+                "final_num_classes": int(metrics_payload["total_num_classes"]),
                 "best_epoch": int(metrics_payload["best_epoch"]),
                 "epochs_ran": int(metrics_payload["epochs_ran"]),
                 "best_val_loss": float(metrics_payload["best_val_loss"]),
                 "best_val_accuracy": float(metrics_payload["best_val_accuracy"]),
-                "test_overall_accuracy": float(metrics_payload["test_overall_accuracy"]),
-                "test_mean_per_class_accuracy": float(metrics_payload["test_mean_per_class_accuracy"]),
-                "elapsed_seconds": float(metrics_payload["elapsed_seconds"]),
-                "num_examples_used_for_training": int(metrics_payload["num_examples_used_for_adaptation"]),
-                "prediction_confidence_mean": float(metrics_payload["prediction_confidence_mean"]),
-                "num_trainable_parameters": int(metrics_payload["num_trainable_parameters"]),
-                "checkpoint_path": metrics_payload["checkpoint_path"],
             }
         )
+        row.update(derived_metrics)
 
     if error_message is not None:
         row["error"] = error_message
@@ -246,14 +265,12 @@ def save_experiment_artifacts(experiment_dir: Path, training_result: dict, metri
 def load_existing_summary(metrics_path: Path):
     """Load the flattened summary from an existing finished experiment."""
     existing_metrics = load_json(metrics_path)
-    summary = existing_metrics.get("summary")
-    if summary is None:
-        summary = build_summary_row(
-            dataset_name=existing_metrics["dataset"],
-            model_name=existing_metrics["model_name"],
-            status="completed",
-            metrics_payload=existing_metrics,
-        )
+    summary = build_summary_row(
+        dataset_name=existing_metrics["dataset"],
+        model_name=existing_metrics["model_name"],
+        status="completed",
+        metrics_payload=existing_metrics,
+    )
     summary["status"] = "skipped_existing"
     return summary
 
