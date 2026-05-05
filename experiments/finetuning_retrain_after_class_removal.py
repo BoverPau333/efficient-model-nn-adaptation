@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from src.experiments_config.class_removal_baseline_config import (
     CLASSES_TO_REMOVE_BY_DATASET,
@@ -32,6 +32,7 @@ DEFAULT_FINETUNING_HEAD_EPOCHS = 5
 DEFAULT_FINETUNING_UNFROZEN_EPOCHS = 10
 DEFAULT_REFERENCE_OUTPUT_DIR = RESULTS_DIR / "full_training_reference_imagenet"
 DEFAULT_OUTPUT_DIR = RESULTS_DIR / "class_removal_finetuning"
+DEFAULT_DATASET_PERCENTAGE = 100.0
 
 
 def parse_args():
@@ -135,6 +136,12 @@ def parse_args():
         action="store_true",
         help="Re-run experiments even if final metrics already exist.",
     )
+    parser.add_argument(
+        "--porc",
+        type=float,
+        default=DEFAULT_DATASET_PERCENTAGE,
+        help="Percentage of the filtered training split to use for fine-tuning (0, 100].",
+    )
     return parser.parse_args()
 
 
@@ -155,6 +162,12 @@ def slugify(value) -> str:
     text = str(value).strip()
     text = re.sub(r"[^A-Za-z0-9]+", "_", text)
     return text.strip("_") or "item"
+
+
+def format_percentage_slug(percentage: float) -> str:
+    """Format a percentage for filesystem-friendly experiment directories."""
+    percentage_text = f"{float(percentage):g}".replace(".", "_")
+    return f"porc_{percentage_text}"
 
 
 def parse_class_identifier(raw_value):
@@ -232,6 +245,21 @@ def build_loader(dataset, batch_size: int, shuffle: bool, num_workers: int, seed
 def count_trainable_parameters(model) -> int:
     """Count how many parameters are updated during training."""
     return sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+
+
+def select_training_subset(dataset, percentage: float, seed: int):
+    """Keep a deterministic percentage of the training dataset."""
+    if percentage <= 0 or percentage > 100:
+        raise ValueError("--porc must be greater than 0 and at most 100.")
+
+    if percentage == 100:
+        return dataset
+
+    total_examples = len(dataset)
+    num_selected = max(1, int(np.ceil(total_examples * (percentage / 100.0))))
+    generator = torch.Generator().manual_seed(seed)
+    selected_indices = torch.randperm(total_examples, generator=generator)[:num_selected].tolist()
+    return Subset(dataset, selected_indices)
 
 
 def set_all_parameters_trainable(model):
@@ -351,6 +379,7 @@ def build_summary_row(
         "training_mode": training_setup["mode_label"],
         "backbone_mode": training_setup["backbone_mode"],
         "trainable_scope": training_setup["trainable_scope"],
+        "train_percentage": float(training_setup["train_percentage"]),
         "status": status,
     }
 
@@ -404,6 +433,7 @@ def load_existing_summary(metrics_path: Path):
                 "mode_label": existing_metrics.get("training_mode", "head_only"),
                 "backbone_mode": existing_metrics.get("backbone_mode", "frozen"),
                 "trainable_scope": existing_metrics.get("trainable_scope", "head_only"),
+                "train_percentage": existing_metrics.get("train_percentage", 100.0),
             },
             metrics_payload=existing_metrics,
         )
@@ -517,6 +547,7 @@ def run_single_experiment(
     experiment_dir = (
         dataset_output_dir
         / slugify(model_name)
+        / format_percentage_slug(args.porc)
         / f"removed_{slugify(removed_class_name)}"
     )
     metrics_path = experiment_dir / "final_metrics.json"
@@ -538,7 +569,8 @@ def run_single_experiment(
     training_setup = resolve_training_setup(args)
 
     set_seed(args.seed)
-    train_loader = build_loader(filtered_train, args.batch_size, True, args.num_workers, args.seed)
+    sampled_train = select_training_subset(filtered_train, args.porc, args.seed)
+    train_loader = build_loader(sampled_train, args.batch_size, True, args.num_workers, args.seed)
     val_loader = build_loader(filtered_val, args.batch_size, False, args.num_workers, args.seed)
     test_loader = build_loader(filtered_test, args.batch_size, False, args.num_workers, args.seed)
 
@@ -552,6 +584,7 @@ def run_single_experiment(
         f"Trainable scope: {training_setup['trainable_scope']}"
     )
     print(f"Training schedule: {training_setup['description']}")
+    print(f"Training split used: {args.porc:g}% ({len(sampled_train)}/{len(filtered_train)} examples)")
     print(f"{'=' * 90}")
 
     num_classes = len(filtered_classes)
@@ -575,7 +608,7 @@ def run_single_experiment(
         num_classes,
     )
 
-    split_counts = aggregate_counts(filtered_train, filtered_val, filtered_test, filtered_classes)
+    split_counts = aggregate_counts(sampled_train, filtered_val, filtered_test, filtered_classes)
     prediction_confidence_mean = evaluate_prediction_confidence(model, test_loader)
     test_per_class_accuracy = {
         class_name: float(per_class_accuracy[class_idx])
@@ -594,6 +627,7 @@ def run_single_experiment(
         "training_mode": training_setup["mode_label"],
         "backbone_mode": training_setup["backbone_mode"],
         "trainable_scope": training_setup["trainable_scope"],
+        "train_percentage": float(args.porc),
         "selection_metric": "validation_loss",
         "max_epochs": int(training_setup["max_epochs"]),
         "head_only_epochs": int(training_setup["head_epochs"]),
@@ -618,6 +652,7 @@ def run_single_experiment(
         "num_trainable_parameters": int(num_trainable_parameters_after),
         "num_trainable_parameters_before_training": int(num_trainable_parameters_before),
         "additional_memory_required": 0.0,
+        "full_filtered_train_examples": int(len(filtered_train)),
         "forgetting_u_olvido": float(forgetting_value),
         "forgetting_reference_source": "full_training_reference_imagenet",
         "forgetting_reference_metrics_path": str(reference_metrics_path),
@@ -651,6 +686,7 @@ def run_all_experiments(args):
     all_summary_rows = []
     base_output_dir = Path(args.output_dir)
     training_setup = resolve_training_setup(args)
+    training_setup["train_percentage"] = float(args.porc)
 
     print(f"Datasets selected: {dataset_names}")
     print(f"Models selected: {list(selected_models)}")
@@ -659,6 +695,7 @@ def run_all_experiments(args):
     print(f"Backbone mode: {training_setup['backbone_mode']}")
     print(f"Trainable scope: {training_setup['trainable_scope']}")
     print(f"Training schedule: {training_setup['description']}")
+    print(f"Training split percentage: {args.porc:g}%")
     print("Selection metric for best checkpoint: validation loss")
 
     for dataset_name in dataset_names:
@@ -737,6 +774,7 @@ def run_all_experiments(args):
                     experiment_dir = (
                         dataset_output_dir
                         / slugify(model_name)
+                        / format_percentage_slug(args.porc)
                         / f"removed_{slugify(removed_class_name)}"
                     )
                     save_json(
