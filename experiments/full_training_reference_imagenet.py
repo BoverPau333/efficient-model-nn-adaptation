@@ -1,24 +1,29 @@
 """Train full-class reference models from ImageNet weights for forgetness comparisons."""
 
 import argparse
-import csv
-import json
-import random
-import re
 import time
 import traceback
 from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
 
+from src.class_removal_experiment_utils import total_examples_from_split_counts
 from src.experiments_config.config import BATCH_SIZE, EPOCHS, LR, NUM_WORKERS, RESULTS_DIR, SEED
 from src.dataset.loaders import DATASET_LOADERS
 from src.dataset.utils import count_examples_per_class
 from src.metrics_elimination import METRICAS_ELIMINACION
 from src.models import IMAGENET_MODEL_BUILDERS
+from src.results_utils import (
+    build_loader,
+    count_trainable_parameters,
+    evaluate_prediction_confidence,
+    load_json,
+    save_json,
+    set_seed,
+    slugify,
+    write_csv,
+)
 from src.training import evaluate, train_with_early_stopping
 
 
@@ -103,92 +108,6 @@ def parse_args():
     return args
 
 
-def set_seed(seed: int):
-    """Seed Python, NumPy and PyTorch."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    if torch.backends.cudnn.is_available():
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
-
-def slugify(value) -> str:
-    """Create filesystem-friendly names."""
-    text = str(value).strip()
-    text = re.sub(r"[^A-Za-z0-9]+", "_", text)
-    return text.strip("_") or "item"
-
-
-def save_json(path: Path, payload):
-    """Write JSON payloads with stable formatting."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, ensure_ascii=True)
-
-
-def load_json(path: Path):
-    """Read a JSON file."""
-    with open(path, "r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def write_csv(path: Path, rows: list):
-    """Write rows to CSV, preserving first-seen column order."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not rows:
-        return
-
-    fieldnames = []
-    seen = set()
-    for row in rows:
-        for key in row:
-            if key not in seen:
-                seen.add(key)
-                fieldnames.append(key)
-
-    with open(path, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def build_loader(dataset, batch_size: int, shuffle: bool, num_workers: int, seed: int):
-    """Construct a dataloader with a deterministic generator."""
-    generator = torch.Generator().manual_seed(seed)
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        generator=generator,
-    )
-
-
-def count_trainable_parameters(model) -> int:
-    """Count how many parameters are updated during training."""
-    return sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
-
-
-def evaluate_prediction_confidence(model, loader) -> float:
-    """Compute the mean max-softmax confidence over a dataloader."""
-    model.eval()
-    confidences = []
-
-    with torch.no_grad():
-        for imgs, _ in loader:
-            imgs = imgs.to(next(model.parameters()).device)
-            probs = F.softmax(model(imgs), dim=1)
-            batch_confidence = probs.max(dim=1).values
-            confidences.extend(batch_confidence.cpu().numpy().tolist())
-
-    if not confidences:
-        return 0.0
-    return float(np.mean(confidences))
-
-
 def aggregate_counts(train_ds, val_ds, test_ds, classes: list):
     """Count examples per class for each split."""
     return {
@@ -196,13 +115,6 @@ def aggregate_counts(train_ds, val_ds, test_ds, classes: list):
         "val": count_examples_per_class(val_ds, classes),
         "test": count_examples_per_class(test_ds, classes),
     }
-
-
-def total_examples_from_split_counts(split_counts: dict, split_name: str = "train") -> int:
-    """Return the total number of examples used for a given split."""
-    return int(sum(split_counts.get(split_name, {}).values()))
-
-
 def derive_summary_metrics(metrics_payload=None):
     """Project reference-training outputs onto the baseline summary schema."""
     if metrics_payload is None:
