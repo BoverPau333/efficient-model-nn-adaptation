@@ -145,6 +145,5 @@ def load_paintings():
 DATASET_LOADERS = {
     "CIFAR-10": load_cifar10,
     "Fashion-MNIST": load_fashion_mnist,
-    "Paintings": load_paintings,
     "Fruits-360": load_fruits360,
 }

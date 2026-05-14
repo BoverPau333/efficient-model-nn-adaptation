@@ -7,9 +7,37 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from sklearn.metrics import confusion_matrix as sk_confusion_matrix
 
 from src.experiments_config.config import DEVICE, EPOCHS, LR
+
+
+def compute_distillation_loss(
+    student_logits,
+    teacher_logits,
+    temperature: float,
+    student_class_indices=None,
+    teacher_class_indices=None,
+):
+    """Calcula la perdida KL de distillation entre logits alineados."""
+    if temperature <= 0:
+        raise ValueError("temperature debe ser positivo.")
+
+    if student_class_indices is not None:
+        student_logits = student_logits[:, student_class_indices]
+    if teacher_class_indices is not None:
+        teacher_logits = teacher_logits[:, teacher_class_indices]
+
+    if student_logits.shape[1] != teacher_logits.shape[1]:
+        raise ValueError(
+            "Student y teacher deben tener el mismo numero de clases tras alinear logits: "
+            f"{student_logits.shape[1]} vs {teacher_logits.shape[1]}"
+        )
+
+    student_log_probs = F.log_softmax(student_logits / temperature, dim=1)
+    teacher_probs = F.softmax(teacher_logits / temperature, dim=1)
+    return F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (temperature ** 2)
 
 
 def train_with_early_stopping(
@@ -20,6 +48,11 @@ def train_with_early_stopping(
     lr=LR,
     patience=None,
     checkpoint_path=None,
+    teacher_model=None,
+    distillation_weight: float = 0.0,
+    distillation_temperature: float = 1.0,
+    student_class_indices=None,
+    teacher_class_indices=None,
     verbose=False,
 ):
     """Train a model and restore the best weights according to validation loss."""
@@ -42,6 +75,8 @@ def train_with_early_stopping(
     for epoch in range(epochs):
         model.train()
         running_train_loss = 0.0
+        running_train_ce_loss = 0.0
+        running_train_distill_loss = 0.0
         running_train_correct = 0
         running_train_examples = 0
 
@@ -49,15 +84,32 @@ def train_with_early_stopping(
             imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
             optimizer.zero_grad()
             logits = model(imgs)
-            loss = loss_fn(logits, labels)
+            ce_loss = loss_fn(logits, labels)
+            distill_loss = torch.zeros((), device=DEVICE)
+            if teacher_model is not None and distillation_weight > 0.0:
+                with torch.no_grad():
+                    teacher_logits = teacher_model(imgs)
+                distill_loss = compute_distillation_loss(
+                    student_logits=logits,
+                    teacher_logits=teacher_logits,
+                    temperature=distillation_temperature,
+                    student_class_indices=student_class_indices,
+                    teacher_class_indices=teacher_class_indices,
+                )
+
+            loss = ce_loss + (distillation_weight * distill_loss)
             loss.backward()
             optimizer.step()
 
             running_train_loss += loss.item()
+            running_train_ce_loss += ce_loss.item()
+            running_train_distill_loss += float(distill_loss.item())
             running_train_correct += int((logits.argmax(dim=1) == labels).sum().item())
             running_train_examples += int(labels.size(0))
 
         avg_train_loss = running_train_loss / len(trainloader)
+        avg_train_ce_loss = running_train_ce_loss / len(trainloader)
+        avg_train_distill_loss = running_train_distill_loss / len(trainloader)
         train_accuracy = running_train_correct / max(running_train_examples, 1)
 
         model.eval()
@@ -77,6 +129,8 @@ def train_with_early_stopping(
         epoch_info = {
             "epoch": epoch + 1,
             "train_loss": float(avg_train_loss),
+            "train_ce_loss": float(avg_train_ce_loss),
+            "train_distill_loss": float(avg_train_distill_loss),
             "train_accuracy": float(train_accuracy),
             "val_loss": float(avg_val_loss),
             "val_accuracy": float(val_accuracy),
@@ -86,7 +140,8 @@ def train_with_early_stopping(
         if verbose:
             print(
                 f"    Epoch {epoch + 1:02d}/{epochs} | "
-                f"train_loss={avg_train_loss:.4f} | train_acc={train_accuracy:.4f} | "
+                f"train_loss={avg_train_loss:.4f} | ce={avg_train_ce_loss:.4f} | "
+                f"distill={avg_train_distill_loss:.4f} | train_acc={train_accuracy:.4f} | "
                 f"val_loss={avg_val_loss:.4f} | val_acc={val_accuracy:.4f}"
             )
 

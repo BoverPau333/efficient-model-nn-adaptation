@@ -1,5 +1,6 @@
 """Fine-tuning dinamico capturando embeddings durante la primera epoca."""
 
+import copy
 import sys
 from pathlib import Path
 from time import perf_counter
@@ -9,6 +10,11 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
+try:
+    torch.multiprocessing.set_sharing_strategy("file_system")
+except (AttributeError, RuntimeError):
+    pass
+
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -17,7 +23,6 @@ from src.class_distance import compute_class_centroids, compute_distance_matrix,
 from src.dataset.loaders import DATASET_LOADERS
 from src.dynamic_dataset_selection import (
     RemappedSubset,
-    sample_balanced_indices,
     select_dynamic_subset,
 )
 from src.dynamic_finetuning_utils import (
@@ -34,11 +39,12 @@ from src.experiments_config.config import DEVICE, RESULTS_DIR
 from src.results_utils import (
     build_loader,
     evaluate_classification_metrics,
+    freeze_backbone_keep_head_trainable,
     load_reference_model,
     remove_output_class,
     set_seed,
 )
-from src.training import train_with_early_stopping
+from src.training import compute_distillation_loss, train_with_early_stopping
 
 
 METHOD_NAME = "epoch1_embeddings_dynamic_finetune"
@@ -53,6 +59,18 @@ def parse_args():
         dataset_choices=DATASET_LOADERS,
     )
     return parser.parse_args()
+
+
+def resolve_original_ids_from_subset(subset_indices, captured_ids):
+    """Convierte ids locales de un subset en ids del dataset padre, si hace falta."""
+    subset_indices = np.asarray(subset_indices, dtype=int)
+    captured_ids = np.asarray(captured_ids, dtype=int)
+    if captured_ids.size == 0:
+        return captured_ids
+
+    if captured_ids.min() >= 0 and captured_ids.max() < len(subset_indices):
+        return subset_indices[captured_ids]
+    return captured_ids
 
 
 def evaluate_loader_loss(model, loader):
@@ -76,7 +94,17 @@ def evaluate_loader_loss(model, loader):
     }
 
 
-def train_first_epoch_with_capture(model, loader, learning_rate: float, representation: str):
+def train_first_epoch_with_capture(
+    model,
+    loader,
+    learning_rate: float,
+    representation: str,
+    teacher_model=None,
+    distillation_weight: float = 0.0,
+    distillation_temperature: float = 1.0,
+    student_class_indices=None,
+    teacher_class_indices=None,
+):
     """Ejecuta una primera epoca capturando embeddings del forward pass."""
     if representation not in {"embeddings", "logits"}:
         raise ValueError("representation debe ser 'embeddings' o 'logits'")
@@ -86,6 +114,8 @@ def train_first_epoch_with_capture(model, loader, learning_rate: float, represen
 
     model.train()
     running_loss = 0.0
+    running_ce_loss = 0.0
+    running_distill_loss = 0.0
     running_correct = 0
     running_examples = 0
     captured_vectors = []
@@ -99,11 +129,25 @@ def train_first_epoch_with_capture(model, loader, learning_rate: float, represen
         optimizer.zero_grad()
         embeddings, logits = model.forward_embeddings_and_logits(imgs)
         selected_vectors = embeddings if representation == "embeddings" else logits
-        loss = loss_fn(logits, labels)
+        ce_loss = loss_fn(logits, labels)
+        distill_loss = torch.zeros((), device=DEVICE)
+        if teacher_model is not None and distillation_weight > 0.0:
+            with torch.no_grad():
+                teacher_logits = teacher_model(imgs)
+            distill_loss = compute_distillation_loss(
+                student_logits=logits,
+                teacher_logits=teacher_logits,
+                temperature=distillation_temperature,
+                student_class_indices=student_class_indices,
+                teacher_class_indices=teacher_class_indices,
+            )
+        loss = ce_loss + (distillation_weight * distill_loss)
         loss.backward()
         optimizer.step()
 
         running_loss += loss.item()
+        running_ce_loss += ce_loss.item()
+        running_distill_loss += float(distill_loss.item())
         running_correct += int((logits.argmax(dim=1) == labels).sum().item())
         running_examples += int(labels.size(0))
 
@@ -113,6 +157,8 @@ def train_first_epoch_with_capture(model, loader, learning_rate: float, represen
 
     return {
         "train_loss": running_loss / max(len(loader), 1),
+        "train_ce_loss": running_ce_loss / max(len(loader), 1),
+        "train_distill_loss": running_distill_loss / max(len(loader), 1),
         "train_accuracy": running_correct / max(running_examples, 1),
         "vectors": np.concatenate(captured_vectors, axis=0),
         "labels": np.concatenate(captured_labels, axis=0),
@@ -142,6 +188,7 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         model_name=model_name,
         modified_class=args.modified_class,
         update_type=args.update_type,
+        train_percentage=args.porc,
     )
     metrics_path = experiment_dir / "final_metrics.json"
     if metrics_path.exists() and not args.overwrite:
@@ -157,25 +204,92 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         model_name=model_name,
         num_classes=len(classes),
     )
+    teacher_model = copy.deepcopy(model)
+    teacher_model.eval()
+    for parameter in teacher_model.parameters():
+        parameter.requires_grad = False
+
+    student_class_indices = None
+    teacher_class_indices = None
     if args.update_type == "remove":
         remove_output_class(model, setup["modified_class_idx_original"])
+        teacher_class_indices = [
+            idx for idx in range(len(classes)) if idx != int(setup["modified_class_idx_original"])
+        ]
+        student_class_indices = list(range(len(setup["active_classes"])))
+    else:
+        common_num_classes = min(len(classes), len(setup["active_classes"]))
+        teacher_class_indices = list(range(common_num_classes))
+        student_class_indices = list(range(common_num_classes))
+    freeze_backbone_keep_head_trainable(model)
 
-    initial_indices = sample_balanced_indices(
-        setup["train_active"],
-        samples_per_class=args.initial_samples_per_class,
+    initial_selection_start = perf_counter()
+    distance_loader = build_loader(
+        IndexedDataset(setup["distance_train_dataset"]),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
         seed=args.seed,
     )
+    initial_embedding_start = perf_counter()
+    initial_extracted = extract_embeddings(
+        model,
+        distance_loader,
+        representation=args.embedding_representation,
+        use_grad=False,
+    )
+    embedding_time = perf_counter() - initial_embedding_start
+
+    normalize_centroids = args.distance_metric == "cosine"
+    initial_centroid_classes, initial_centroids = compute_class_centroids(
+        initial_extracted["vectors"],
+        initial_extracted["labels"],
+        normalize=normalize_centroids,
+    )
+    initial_distance_matrix = compute_distance_matrix(initial_centroids, metric=args.distance_metric)
+    initial_neighbours = get_nearest_classes(
+        initial_centroid_classes,
+        initial_distance_matrix,
+        modified_class_idx=setup["modified_class_idx_original"],
+        k_neighbours=args.k_neighbours,
+    )
+    initial_neighbour_class_indices = [item["class_idx"] for item in initial_neighbours]
+    initial_centroid_map = {
+        int(class_idx): initial_centroids[pos]
+        for pos, class_idx in enumerate(initial_centroid_classes)
+    }
+    initial_subset, initial_selection_details = select_dynamic_subset(
+        dataset=setup["distance_train_dataset"],
+        embeddings=initial_extracted["vectors"],
+        labels=initial_extracted["labels"],
+        ids=initial_extracted["ids"],
+        modified_class_idx=setup["modified_class_idx_original"],
+        neighbour_class_indices=initial_neighbour_class_indices,
+        class_centroids=initial_centroid_map,
+        target_percentage=args.porc,
+        train_dataset_size=len(setup["train_active"]),
+        modified_class_weight=args.samples_per_modified_class,
+        neighbour_class_weight=args.samples_per_neighbour_class,
+        far_class_weight=args.memory_samples_per_far_class,
+        selection_strategy=args.selection_strategy,
+        score_alpha=args.score_alpha,
+        score_beta=args.score_beta,
+        score_gamma=args.score_gamma,
+        seed=args.seed,
+        update_type=args.update_type,
+    )
+    initial_selection_time = perf_counter() - initial_selection_start
     if args.update_type == "remove":
         initial_train_subset = RemappedSubset(
             train_ds,
-            [setup["train_active"].indices[idx] for idx in initial_indices],
+            initial_subset.indices,
             label_mapping=setup["label_mapping_after_removal"],
             classes=setup["active_classes"],
         )
     else:
         initial_train_subset = RemappedSubset(
-            setup["train_active"],
-            initial_indices,
+            train_ds,
+            initial_subset.indices,
             label_mapping=None,
             classes=setup["active_classes"],
         )
@@ -208,21 +322,26 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         initial_train_loader,
         learning_rate=args.learning_rate,
         representation=args.embedding_representation,
+        teacher_model=teacher_model,
+        distillation_weight=args.distillation_weight,
+        distillation_temperature=args.distillation_temperature,
+        student_class_indices=student_class_indices,
+        teacher_class_indices=teacher_class_indices,
     )
     first_epoch_time = perf_counter() - first_epoch_start
     validation_after_first = evaluate_loader_loss(model, val_loader)
     history_rows = [
         {
             "epoch": 1,
-            "phase": "initial_balanced_epoch",
+            "phase": "initial_distance_guided_epoch",
             "train_loss": float(first_epoch_result["train_loss"]),
+            "train_ce_loss": float(first_epoch_result["train_ce_loss"]),
+            "train_distill_loss": float(first_epoch_result["train_distill_loss"]),
             "train_accuracy": float(first_epoch_result["train_accuracy"]),
             "val_loss": float(validation_after_first["val_loss"]),
             "val_accuracy": float(validation_after_first["val_accuracy"]),
         }
     ]
-
-    embedding_time = float(first_epoch_time)
     selection_start = perf_counter()
 
     captured_embeddings = first_epoch_result["vectors"]
@@ -230,7 +349,7 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
     captured_ids = first_epoch_result["ids"]
 
     if args.update_type == "remove":
-        original_ids = np.asarray([initial_train_subset.indices[int(idx)] for idx in captured_ids], dtype=int)
+        original_ids = resolve_original_ids_from_subset(initial_train_subset.indices, captured_ids)
         original_labels = np.asarray([inverse_label_mapping[int(label)] for label in captured_labels], dtype=int)
 
         removed_only_indices = np.flatnonzero(np.asarray(train_ds.targets) == setup["modified_class_idx_original"]).tolist()
@@ -258,7 +377,6 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         original_ids = captured_ids
         original_labels = captured_labels
 
-    normalize_centroids = args.distance_metric == "cosine"
     centroid_classes, centroids = compute_class_centroids(
         captured_embeddings,
         original_labels,
@@ -273,49 +391,29 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
     )
     neighbour_class_indices = [item["class_idx"] for item in neighbours]
 
-    candidate_original_indices = []
-    original_targets = np.asarray(train_ds.targets)
-    for class_idx in neighbour_class_indices:
-        candidate_original_indices.extend(np.flatnonzero(original_targets == int(class_idx)).tolist())
-    if args.update_type == "add":
-        candidate_original_indices.extend(
-            np.flatnonzero(original_targets == int(setup["modified_class_idx_original"])).tolist()
-        )
-    candidate_original_indices = sorted(set(candidate_original_indices))
-    candidate_dataset = torch.utils.data.Subset(train_ds, candidate_original_indices)
-    candidate_loader = build_loader(
-        IndexedDataset(candidate_dataset),
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        seed=args.seed,
-    )
-    candidate_embedding_start = perf_counter()
-    candidate_extracted = extract_embeddings(
-        model,
-        candidate_loader,
-        representation=args.embedding_representation,
-        use_grad=False,
-    )
-    embedding_time += perf_counter() - candidate_embedding_start
-
     centroid_map = {int(class_idx): centroids[pos] for pos, class_idx in enumerate(centroid_classes)}
     selected_subset, selection_details = select_dynamic_subset(
         dataset=train_ds,
-        embeddings=candidate_extracted["vectors"],
-        labels=candidate_extracted["labels"],
-        ids=np.asarray([candidate_original_indices[int(idx)] for idx in candidate_extracted["ids"]], dtype=int),
+        embeddings=captured_embeddings,
+        labels=original_labels,
+        ids=original_ids,
         modified_class_idx=setup["modified_class_idx_original"],
         neighbour_class_indices=neighbour_class_indices,
         class_centroids=centroid_map,
-        samples_per_modified_class=args.samples_per_modified_class,
-        samples_per_neighbour_class=args.samples_per_neighbour_class,
-        memory_samples_per_far_class=args.memory_samples_per_far_class,
+        target_percentage=args.porc,
+        train_dataset_size=len(setup["train_active"]),
+        modified_class_weight=args.samples_per_modified_class,
+        neighbour_class_weight=args.samples_per_neighbour_class,
+        far_class_weight=args.memory_samples_per_far_class,
         selection_strategy=args.selection_strategy,
+        score_alpha=args.score_alpha,
+        score_beta=args.score_beta,
+        score_gamma=args.score_gamma,
         seed=args.seed,
         update_type=args.update_type,
     )
-    selection_time = perf_counter() - selection_start
+    selection_time = initial_selection_time + (perf_counter() - selection_start)
+    selection_details["initial_selection"] = initial_selection_details
 
     if args.update_type == "remove":
         selected_train = RemappedSubset(
@@ -348,8 +446,13 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
             val_loader,
             epochs=remaining_epochs,
             lr=args.learning_rate,
-            patience=None,
+            patience=args.patience,
             checkpoint_path=None,
+            teacher_model=teacher_model,
+            distillation_weight=args.distillation_weight,
+            distillation_temperature=args.distillation_temperature,
+            student_class_indices=student_class_indices,
+            teacher_class_indices=teacher_class_indices,
             verbose=True,
         )
         for epoch_info in remaining_result["history"]:

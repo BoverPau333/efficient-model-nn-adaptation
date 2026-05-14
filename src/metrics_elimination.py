@@ -13,6 +13,7 @@ class MetricaEliminacion:
     """Representa una metrica relevante para comparar metodos de eliminacion."""
 
     nombre: str
+    nm: str
     prioridad: str
     por_que_importa: str
 
@@ -20,6 +21,7 @@ class MetricaEliminacion:
 METRICAS_ELIMINACION = [
     MetricaEliminacion(
         nombre="Tiempo total de adaptacion",
+        nm ="t_total",
         prioridad="critica",
         por_que_importa=(
             "Es la metrica principal de eficiencia. Permite comparar de forma "
@@ -28,6 +30,7 @@ METRICAS_ELIMINACION = [
     ),
     MetricaEliminacion(
         nombre="Accuracy global",
+        nm ="acc_total",
         prioridad="critica",
         por_que_importa=(
             "Es la referencia principal de calidad final. Permite comprobar si la "
@@ -36,6 +39,7 @@ METRICAS_ELIMINACION = [
     ),
     MetricaEliminacion(
         nombre="Accuracy por clase",
+        nm ="acc_pc",
         prioridad="alta",
         por_que_importa=(
             "Permite detectar si algunos metodos perjudican mas que otros a "
@@ -44,6 +48,7 @@ METRICAS_ELIMINACION = [
     ),
     MetricaEliminacion(
         nombre="Accuracy en clases restantes",
+        nm ="acc_pc_res",
         prioridad="alta",
         por_que_importa=(
             "Mide hasta que punto cada metodo conserva el conocimiento valido "
@@ -52,6 +57,7 @@ METRICAS_ELIMINACION = [
     ),
     MetricaEliminacion(
         nombre="Forgetting u olvido",
+        nm ="olv",
         prioridad="alta",
         por_que_importa=(
             "Cuantifica cuanto empeora el rendimiento en las clases que se "
@@ -61,6 +67,7 @@ METRICAS_ELIMINACION = [
     ),
     MetricaEliminacion(
         nombre="Numero de ejemplos utilizados",
+        nm ="n_ejmp",
         prioridad="media",
         por_que_importa=(
             "Permite comparar cuantas muestras necesita cada metodo para "
@@ -70,6 +77,7 @@ METRICAS_ELIMINACION = [
     ),
     MetricaEliminacion(
         nombre="Confianza de prediccion",
+        nm ="conf",
         prioridad="media",
         por_que_importa=(
             "Ayuda a ver si un metodo mantiene predicciones seguras despues de "
@@ -78,6 +86,7 @@ METRICAS_ELIMINACION = [
     ),
     MetricaEliminacion(
         nombre="Numero de parametros entrenados o modificados",
+        nm ="n_param",
         prioridad="media",
         por_que_importa=(
             "Es util para comparar metodos como reentrenamiento completo, "
@@ -86,6 +95,7 @@ METRICAS_ELIMINACION = [
     ),
     MetricaEliminacion(
         nombre="Memoria adicional requerida",
+        nm ="ext_mem",
         prioridad="media",
         por_que_importa=(
             "Complementa al tiempo de adaptacion, porque algunos metodos pueden "
@@ -95,31 +105,18 @@ METRICAS_ELIMINACION = [
     ),
 ]
 
+# Compatibilidad hacia atras: algunos imports del paquete `src` siguen esperando
+# esta constante aunque ahora no estemos manteniendo una lista separada.
+METRICAS_MENOS_RELEVANTES_O_NO_APLICABLES = []
 
-METRICAS_MENOS_RELEVANTES_O_NO_APLICABLES = [
-    {
-        "nombre": "Accuracy en clases nuevas o modificadas",
-        "motivo": (
-            "No suele aplicar directamente a eliminacion de clases, porque no se "
-            "anaden clases nuevas. Solo seria util si ademas se redefine alguna "
-            "clase existente."
-        ),
-    },
-]
 
 
 def imprimir_metricas_eliminacion():
     """Muestra un resumen legible de las metricas seleccionadas."""
-    print("Metricas recomendadas para comparar metodos de eliminacion:\n")
+    print("Metricas para comparar metodos de eliminacion:\n")
     for metrica in METRICAS_ELIMINACION:
         print(f"- {metrica.nombre} [{metrica.prioridad}]")
         print(f"  {metrica.por_que_importa}\n")
-
-    if METRICAS_MENOS_RELEVANTES_O_NO_APLICABLES:
-        print("Metricas menos relevantes o no aplicables:\n")
-        for item in METRICAS_MENOS_RELEVANTES_O_NO_APLICABLES:
-            print(f"- {item['nombre']}")
-            print(f"  {item['motivo']}\n")
 
 
 if __name__ == "__main__":

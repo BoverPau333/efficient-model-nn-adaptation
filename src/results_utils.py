@@ -197,6 +197,23 @@ def remove_output_class(model, removed_class_idx: int):
     return model
 
 
+def freeze_backbone_keep_head_trainable(model):
+    """Congela el cuerpo del modelo y deja entrenable solo la cabecera lineal final."""
+    head_ref, head = _get_linear_head(model)
+
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+
+    if head_ref == "fc":
+        for parameter in model.fc.parameters():
+            parameter.requires_grad = True
+    else:
+        for parameter in model.classifier.parameters():
+            parameter.requires_grad = True
+
+    return model
+
+
 def load_reference_model(reference_dir: Path, dataset_name: str, model_name: str, num_classes: int):
     """Carga el modelo de referencia entrenado y sus metricas."""
     experiment_dir = reference_dir / slugify(dataset_name) / slugify(model_name)

@@ -14,6 +14,10 @@ DATASET_PORC="${DATASET_PORC:-100}"
 "$ENV_PY" -V
 "$ENV_PY" -c "import torch; print(torch.__version__); print(torch.cuda.is_available())"
 
-"$ENV_PY" -m experiments.finetuning_retrain_after_class_removal --all-datasets --overwrite --porc "$DATASET_PORC"
+"$ENV_PY" -m experiments.frozen_backbone_head_retrain_after_class_removal \
+    --all-datasets \
+    --overwrite \
+    --output-dir /mnt/homeGPU/pbovera/results/class_removal_frozen_backbone_head \
+    --epochs 5
 
-mail -s "tfg_train finalizado" pauboverfemenias@gmail.com <<< "finetuning_retrain_after_class_removal.py ha terminado"
+mail -s "tfg_train finalizado" pauboverfemenias@gmail.com <<< "frozen_backbone_head_retrain_after_class_removal.py ha terminado"

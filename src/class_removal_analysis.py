@@ -1,0 +1,360 @@
+"""Analisis agregado de resultados de fine-tuning tras eliminacion de clases."""
+
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+from src.results_utils import load_json, write_csv
+
+
+def _percentage_slug(percentage: float) -> str:
+    text = f"{float(percentage):g}".replace(".", "_")
+    return f"porc_{text}"
+
+
+def iter_finetuning_runs(results_dir: Path):
+    """Itera por las ejecuciones con `final_metrics.json` dentro del directorio dado."""
+    for metrics_path in sorted(results_dir.glob("**/final_metrics.json")):
+        try:
+            metrics = load_json(metrics_path)
+        except Exception:
+            continue
+        yield metrics_path, metrics
+
+
+def build_percentage_summary_row(metrics_path: Path, metrics: dict):
+    """Aplana una ejecucion a una fila de resumen por porcentaje."""
+    return {
+        "dataset": metrics.get("dataset"),
+        "model_name": metrics.get("model_name"),
+        "removed_class": metrics.get("removed_class"),
+        "train_percentage": float(metrics.get("train_percentage", 100.0)),
+        "training_mode": metrics.get("training_mode"),
+        "backbone_mode": metrics.get("backbone_mode"),
+        "trainable_scope": metrics.get("trainable_scope"),
+        "best_epoch": int(metrics.get("best_epoch", 0)),
+        "epochs_ran": int(metrics.get("epochs_ran", 0)),
+        "best_val_loss": float(metrics.get("best_val_loss", 0.0)),
+        "best_val_accuracy": float(metrics.get("best_val_accuracy", 0.0)),
+        "elapsed_seconds": float(metrics.get("elapsed_seconds", 0.0)),
+        "test_overall_accuracy": float(metrics.get("test_overall_accuracy", 0.0)),
+        "test_mean_per_class_accuracy": float(metrics.get("test_mean_per_class_accuracy", 0.0)),
+        "forgetting_u_olvido": metrics.get("forgetting_u_olvido"),
+        "num_examples_used_for_adaptation": int(metrics.get("num_examples_used_for_adaptation", 0)),
+        "prediction_confidence_mean": float(metrics.get("prediction_confidence_mean", 0.0)),
+        "num_trainable_parameters": int(metrics.get("num_trainable_parameters", 0)),
+        "experiment_dir": str(metrics_path.parent),
+        "training_history_csv": str(metrics_path.parent / "training_history.csv"),
+    }
+
+
+def collect_percentage_summaries(results_dir: Path):
+    """Agrupa las ejecuciones por porcentaje."""
+    rows_by_percentage = {}
+    deduped_rows = {}
+    for metrics_path, metrics in iter_finetuning_runs(results_dir):
+        row = build_percentage_summary_row(metrics_path, metrics)
+        percentage = float(row["train_percentage"])
+        dedupe_key = (
+            percentage,
+            row["dataset"],
+            row["model_name"],
+            row["removed_class"],
+        )
+        existing_row = deduped_rows.get(dedupe_key)
+        if existing_row is None:
+            deduped_rows[dedupe_key] = row
+            continue
+
+        current_dir = str(row["experiment_dir"])
+        existing_dir = str(existing_row["experiment_dir"])
+        if "/porc_100/" not in current_dir and "/porc_100/" in existing_dir:
+            deduped_rows[dedupe_key] = row
+
+    for row in deduped_rows.values():
+        percentage = float(row["train_percentage"])
+        rows_by_percentage.setdefault(percentage, []).append(row)
+    return rows_by_percentage
+
+
+def save_percentage_summaries(results_dir: Path, rows_by_percentage: dict):
+    """Guarda una tabla CSV por porcentaje y una combinada."""
+    output_dir = results_dir / "percentage_summaries"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    all_rows = []
+    for percentage, rows in sorted(rows_by_percentage.items()):
+        rows = sorted(rows, key=lambda row: (row["dataset"], row["model_name"], row["removed_class"]))
+        all_rows.extend(rows)
+        write_csv(output_dir / f"summary_{_percentage_slug(percentage)}.csv", rows)
+
+    if all_rows:
+        write_csv(output_dir / "summary_all_percentages.csv", all_rows)
+
+
+def _read_training_history_csv(path: Path):
+    import csv
+
+    with open(path, newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def aggregate_learning_curves(rows_by_percentage: dict):
+    """Calcula la curva media por porcentaje y epoca."""
+    aggregated = {}
+
+    for percentage, rows in rows_by_percentage.items():
+        stats_by_epoch = {}
+        for row in rows:
+            history_path = Path(row["training_history_csv"])
+            if not history_path.exists():
+                continue
+            history_rows = _read_training_history_csv(history_path)
+            for epoch_row in history_rows:
+                epoch = int(epoch_row["epoch"])
+                bucket = stats_by_epoch.setdefault(
+                    epoch,
+                    {
+                        "train_loss": [],
+                        "val_loss": [],
+                        "train_accuracy": [],
+                        "val_accuracy": [],
+                    },
+                )
+                bucket["train_loss"].append(float(epoch_row["train_loss"]))
+                bucket["val_loss"].append(float(epoch_row["val_loss"]))
+                bucket["train_accuracy"].append(float(epoch_row["train_accuracy"]))
+                bucket["val_accuracy"].append(float(epoch_row["val_accuracy"]))
+
+        aggregated_rows = []
+        for epoch in sorted(stats_by_epoch):
+            bucket = stats_by_epoch[epoch]
+            aggregated_rows.append(
+                {
+                    "train_percentage": float(percentage),
+                    "epoch": int(epoch),
+                    "num_runs": int(len(bucket["val_accuracy"])),
+                    "train_loss_mean": float(np.mean(bucket["train_loss"])),
+                    "train_loss_std": float(np.std(bucket["train_loss"])),
+                    "val_loss_mean": float(np.mean(bucket["val_loss"])),
+                    "val_loss_std": float(np.std(bucket["val_loss"])),
+                    "train_accuracy_mean": float(np.mean(bucket["train_accuracy"])),
+                    "train_accuracy_std": float(np.std(bucket["train_accuracy"])),
+                    "val_accuracy_mean": float(np.mean(bucket["val_accuracy"])),
+                    "val_accuracy_std": float(np.std(bucket["val_accuracy"])),
+                }
+            )
+        aggregated[float(percentage)] = aggregated_rows
+
+    return aggregated
+
+
+def save_aggregated_learning_curves(results_dir: Path, aggregated_curves: dict):
+    """Guarda los CSV con curvas medias por porcentaje."""
+    output_dir = results_dir / "percentage_summaries"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for percentage, rows in sorted(aggregated_curves.items()):
+        if rows:
+            write_csv(output_dir / f"mean_learning_curve_{_percentage_slug(percentage)}.csv", rows)
+
+
+def plot_mean_learning_curves_by_percentage(results_dir: Path, aggregated_curves: dict):
+    """Dibuja la curva media de validacion para 100, 50, 20 y 10 si existen."""
+    selected_percentages = [100.0, 50.0, 20.0, 10.0]
+    available = [percentage for percentage in selected_percentages if percentage in aggregated_curves and aggregated_curves[percentage]]
+    if not available:
+        return None
+
+    colors = {
+        100.0: "#1f77b4",
+        50.0: "#ff7f0e",
+        20.0: "#2ca02c",
+        10.0: "#d62728",
+    }
+
+    plots_dir = results_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    save_path = plots_dir / "mean_learning_curve_by_percentage.png"
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for percentage in available:
+        rows = aggregated_curves[percentage]
+        epochs = [row["epoch"] for row in rows]
+        mean_vals = np.array([row["val_accuracy_mean"] for row in rows], dtype=float)
+        std_vals = np.array([row["val_accuracy_std"] for row in rows], dtype=float)
+        label = "100%" if percentage == 100.0 else f"{int(percentage)}%"
+        color = colors.get(percentage, None)
+
+        ax.plot(epochs, mean_vals, marker="o", linewidth=2.2, label=label, color=color)
+        ax.fill_between(epochs, mean_vals - std_vals, mean_vals + std_vals, alpha=0.15, color=color)
+
+    ax.set_xlabel("Epoch", fontsize=11)
+    ax.set_ylabel("Mean validation accuracy", fontsize=11)
+    ax.set_title("Curva de aprendizaje media por porcentaje", fontsize=13, fontweight="bold")
+    ax.grid(True, alpha=0.3)
+    ax.legend(title="Training split")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=180)
+    plt.close(fig)
+    return save_path
+
+
+def plot_accuracy_and_variability_by_percentage(results_dir: Path, rows_by_percentage: dict):
+    """Genera dos graficas separadas: accuracy medio y variabilidad por porcentaje."""
+    if not rows_by_percentage:
+        return []
+
+    percentages = sorted(rows_by_percentage.keys(), reverse=True)
+    accuracy_means = []
+    accuracy_stds = []
+
+    for percentage in percentages:
+        accuracies = [
+            float(row["test_overall_accuracy"])
+            for row in rows_by_percentage[percentage]
+            if row.get("test_overall_accuracy") is not None
+        ]
+        if accuracies:
+            accuracy_means.append(float(np.mean(accuracies)) * 100.0)
+            accuracy_stds.append(float(np.std(accuracies)) * 100.0)
+        else:
+            accuracy_means.append(np.nan)
+            accuracy_stds.append(np.nan)
+
+    plots_dir = results_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_paths = []
+
+    fig, ax = plt.subplots(figsize=(8.5, 5.5))
+    ax.plot(percentages, accuracy_means, marker="o", linewidth=2.4, color="#1f77b4")
+    for x_value, y_value in zip(percentages, accuracy_means):
+        if np.isnan(y_value):
+            continue
+        ax.annotate(f"{y_value:.2f}%", (x_value, y_value), textcoords="offset points", xytext=(0, 8), ha="center")
+    ax.set_xlabel("Porcentaje de entrenamiento usado", fontsize=11)
+    ax.set_ylabel("Accuracy medio (%)", fontsize=11)
+    ax.set_title("Decremento del accuracy segun el porcentaje", fontsize=13, fontweight="bold")
+    ax.set_xticks(percentages)
+    ax.set_xlim(max(percentages), min(percentages))
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    accuracy_path = plots_dir / "accuracy_vs_percentage.png"
+    plt.savefig(accuracy_path, dpi=180)
+    plt.close(fig)
+    saved_paths.append(accuracy_path)
+
+    fig, ax = plt.subplots(figsize=(8.5, 5.5))
+    ax.plot(percentages, accuracy_stds, marker="o", linewidth=2.4, color="#d62728")
+    for x_value, y_value in zip(percentages, accuracy_stds):
+        if np.isnan(y_value):
+            continue
+        ax.annotate(f"{y_value:.2f}%", (x_value, y_value), textcoords="offset points", xytext=(0, 8), ha="center")
+    ax.set_xlabel("Porcentaje de entrenamiento usado", fontsize=11)
+    ax.set_ylabel("Desviacion estandar del accuracy (%)", fontsize=11)
+    ax.set_title("Variabilidad de resultados segun el porcentaje", fontsize=13, fontweight="bold")
+    ax.set_xticks(percentages)
+    ax.set_xlim(max(percentages), min(percentages))
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    variability_path = plots_dir / "variability_vs_percentage.png"
+    plt.savefig(variability_path, dpi=180)
+    plt.close(fig)
+    saved_paths.append(variability_path)
+
+    return saved_paths
+
+
+def plot_accuracy_and_variability_by_percentage_per_dataset(results_dir: Path, rows_by_percentage: dict):
+    """Genera dos graficas con una linea por dataset."""
+    if not rows_by_percentage:
+        return []
+
+    percentages = sorted(rows_by_percentage.keys(), reverse=True)
+    datasets = sorted(
+        {
+            row["dataset"]
+            for rows in rows_by_percentage.values()
+            for row in rows
+            if row.get("dataset")
+        }
+    )
+    if not datasets:
+        return []
+
+    colors = {
+        "CIFAR-10": "#1f77b4",
+        "Fashion-MNIST": "#ff7f0e",
+        "Fruits-360": "#2ca02c",
+    }
+
+    accuracy_by_dataset = {dataset: [] for dataset in datasets}
+    variability_by_dataset = {dataset: [] for dataset in datasets}
+
+    for dataset in datasets:
+        for percentage in percentages:
+            accuracies = [
+                float(row["test_overall_accuracy"])
+                for row in rows_by_percentage[percentage]
+                if row.get("dataset") == dataset and row.get("test_overall_accuracy") is not None
+            ]
+            if accuracies:
+                accuracy_by_dataset[dataset].append(float(np.mean(accuracies)) * 100.0)
+                variability_by_dataset[dataset].append(float(np.std(accuracies)) * 100.0)
+            else:
+                accuracy_by_dataset[dataset].append(np.nan)
+                variability_by_dataset[dataset].append(np.nan)
+
+    plots_dir = results_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    saved_paths = []
+
+    fig, ax = plt.subplots(figsize=(9.2, 5.8))
+    for dataset in datasets:
+        ax.plot(
+            percentages,
+            accuracy_by_dataset[dataset],
+            marker="o",
+            linewidth=2.2,
+            label=dataset,
+            color=colors.get(dataset),
+        )
+    ax.set_xlabel("Porcentaje de entrenamiento usado", fontsize=11)
+    ax.set_ylabel("Accuracy medio (%)", fontsize=11)
+    ax.set_title("Accuracy segun el porcentaje por dataset", fontsize=13, fontweight="bold")
+    ax.set_xticks(percentages)
+    ax.set_xlim(max(percentages), min(percentages))
+    ax.grid(True, alpha=0.3)
+    ax.legend(title="Dataset")
+    plt.tight_layout()
+    accuracy_path = plots_dir / "accuracy_vs_percentage_by_dataset.png"
+    plt.savefig(accuracy_path, dpi=180)
+    plt.close(fig)
+    saved_paths.append(accuracy_path)
+
+    fig, ax = plt.subplots(figsize=(9.2, 5.8))
+    for dataset in datasets:
+        ax.plot(
+            percentages,
+            variability_by_dataset[dataset],
+            marker="o",
+            linewidth=2.2,
+            label=dataset,
+            color=colors.get(dataset),
+        )
+    ax.set_xlabel("Porcentaje de entrenamiento usado", fontsize=11)
+    ax.set_ylabel("Desviacion estandar del accuracy (%)", fontsize=11)
+    ax.set_title("Variabilidad segun el porcentaje por dataset", fontsize=13, fontweight="bold")
+    ax.set_xticks(percentages)
+    ax.set_xlim(max(percentages), min(percentages))
+    ax.grid(True, alpha=0.3)
+    ax.legend(title="Dataset")
+    plt.tight_layout()
+    variability_path = plots_dir / "variability_vs_percentage_by_dataset.png"
+    plt.savefig(variability_path, dpi=180)
+    plt.close(fig)
+    saved_paths.append(variability_path)
+
+    return saved_paths

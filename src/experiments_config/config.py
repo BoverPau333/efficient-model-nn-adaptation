@@ -4,6 +4,11 @@ from pathlib import Path
 
 import torch
 
+try:
+    torch.multiprocessing.set_sharing_strategy("file_system")
+except (AttributeError, RuntimeError):
+    pass
+
 
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = ROOT_DIR / "datasets" / "data"
@@ -22,4 +27,3 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 RESULTS_DIR.mkdir(exist_ok=True)
 PLOTS_DIR.mkdir(exist_ok=True)
-

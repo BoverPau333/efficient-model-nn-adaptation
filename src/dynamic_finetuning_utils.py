@@ -5,6 +5,7 @@ import time
 import traceback
 from pathlib import Path
 
+from src.class_removal_experiment_utils import format_percentage_slug
 from src.dataset.utils import remove_class_and_remap, resolve_class_to_remove
 from src.experiments_config.config import BATCH_SIZE, LR, NUM_WORKERS, RESULTS_DIR, SEED
 from src.results_utils import (
@@ -69,15 +70,46 @@ def build_dynamic_arg_parser(description: str, default_output_dir: Path, dataset
     parser.add_argument("--models", nargs="*", default=["MobileNetV3-Small"], help="Modelos a ejecutar.")
     parser.add_argument("--modified-class", required=True, help="Clase modificada: indice o nombre.")
     parser.add_argument("--update-type", choices=["add", "remove"], default="remove")
+    parser.add_argument("--porc", type=float, default=10.0, help="Porcentaje del split de entrenamiento a usar.")
     parser.add_argument("--k-neighbours", type=int, default=3)
     parser.add_argument("--distance-metric", choices=["cosine", "euclidean"], default="cosine")
     parser.add_argument("--initial-samples-per-class", type=int, default=8)
     parser.add_argument("--samples-per-modified-class", type=int, default=64)
     parser.add_argument("--samples-per-neighbour-class", type=int, default=32)
-    parser.add_argument("--memory-samples-per-far-class", type=int, default=4)
-    parser.add_argument("--selection-strategy", choices=["frontier", "nearest_to_modified"], default="frontier")
+    parser.add_argument(
+        "--memory-samples-per-far-class",
+        type=int,
+        default=15,
+        help="Objetivo de ejemplos de memoria diversos por clase lejana (10-20 recomendado).",
+    )
+    parser.add_argument(
+        "--selection-strategy",
+        choices=["frontier", "nearest_to_modified", "composite_score"],
+        default="composite_score",
+    )
+    parser.add_argument("--score-alpha", type=float, default=0.3, help="Peso de cercania a la clase eliminada.")
+    parser.add_argument("--score-beta", type=float, default=0.4, help="Peso de cercania a la clase real.")
+    parser.add_argument("--score-gamma", type=float, default=0.3, help="Peso del termino de diversidad.")
     parser.add_argument("--embedding-representation", choices=["embeddings", "logits"], default="embeddings")
+    parser.add_argument(
+        "--distillation-weight",
+        type=float,
+        default=1.0,
+        help="Peso lambda del termino de distillation.",
+    )
+    parser.add_argument(
+        "--distillation-temperature",
+        type=float,
+        default=2.0,
+        help="Temperatura usada en la distillation.",
+    )
     parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=2,
+        help="Paciencia para early stopping sobre validation loss.",
+    )
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--learning-rate", type=float, default=LR)
     parser.add_argument("--num-workers", type=int, default=NUM_WORKERS)
@@ -89,12 +121,20 @@ def build_dynamic_arg_parser(description: str, default_output_dir: Path, dataset
     return parser
 
 
-def build_experiment_dir(base_output_dir: Path, dataset_name: str, model_name: str, modified_class, update_type: str):
+def build_experiment_dir(
+    base_output_dir: Path,
+    dataset_name: str,
+    model_name: str,
+    modified_class,
+    update_type: str,
+    train_percentage: float,
+):
     """Crea la ruta del experimento dinamico."""
     return (
         base_output_dir
         / slugify(dataset_name)
         / slugify(model_name)
+        / format_percentage_slug(train_percentage)
         / f"{update_type}_{slugify(modified_class)}"
     )
 
@@ -152,13 +192,22 @@ def build_dynamic_run_config(args, dataset_name: str, model_name: str, method_na
         "model_name": model_name,
         "method": method_name,
         "embedding_strategy": embedding_strategy,
+        "backbone_mode": "frozen",
+        "trainable_scope": "head_only",
         "modified_class": str(args.modified_class),
         "update_type": args.update_type,
+        "train_percentage": float(args.porc),
         "k_neighbours": int(args.k_neighbours),
         "distance_metric": args.distance_metric,
         "selection_strategy": args.selection_strategy,
+        "score_alpha": float(args.score_alpha),
+        "score_beta": float(args.score_beta),
+        "score_gamma": float(args.score_gamma),
         "embedding_representation": args.embedding_representation,
+        "distillation_weight": float(args.distillation_weight),
+        "distillation_temperature": float(args.distillation_temperature),
         "epochs": int(args.epochs),
+        "patience": int(args.patience),
         "batch_size": int(args.batch_size),
         "learning_rate": float(args.learning_rate),
         "num_workers": int(args.num_workers),
@@ -215,12 +264,20 @@ def finalize_dynamic_experiment(
         "model_name": model_name,
         "method": method_name,
         "embedding_strategy": embedding_strategy,
+        "backbone_mode": "frozen",
+        "trainable_scope": "head_only",
         "update_type": args.update_type,
         "modified_class": setup["modified_class_name"],
         "modified_class_idx_original": int(setup["modified_class_idx_original"]),
+        "train_percentage": float(args.porc),
         "distance_metric": args.distance_metric,
         "selection_strategy": args.selection_strategy,
+        "score_alpha": float(args.score_alpha),
+        "score_beta": float(args.score_beta),
+        "score_gamma": float(args.score_gamma),
         "embedding_representation": args.embedding_representation,
+        "distillation_weight": float(args.distillation_weight),
+        "distillation_temperature": float(args.distillation_temperature),
         "k_neighbours": int(args.k_neighbours),
         "neighbour_classes": [
             {
@@ -235,6 +292,7 @@ def finalize_dynamic_experiment(
         "reference_metrics_path": str(reference_metrics_path),
         "final_num_classes": int(setup["final_num_classes"]),
         "epochs_requested": int(args.epochs),
+        "patience": int(args.patience),
         "epochs_ran": int(training_summary["epochs_ran"]),
         "best_epoch": int(training_summary["best_epoch"]),
         "best_val_loss": float(training_summary["best_val_loss"]),
@@ -313,6 +371,7 @@ def build_failed_dynamic_summary(args, model_name: str, method_name: str, embedd
         "update_type": args.update_type,
         "method": method_name,
         "embedding_strategy": embedding_strategy,
+        "train_percentage": float(args.porc),
         "modified_class": str(args.modified_class),
         "error": error_message,
     }
@@ -343,6 +402,7 @@ def run_dynamic_experiment_suite(args, method_name: str, embedding_strategy: str
                 model_name=model_name,
                 modified_class=args.modified_class,
                 update_type=args.update_type,
+                train_percentage=args.porc,
             )
             error_dir.mkdir(parents=True, exist_ok=True)
             save_json(

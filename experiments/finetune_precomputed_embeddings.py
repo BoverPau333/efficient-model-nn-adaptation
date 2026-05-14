@@ -1,8 +1,16 @@
 """Fine-tuning dinamico con embeddings precomputados antes de adaptar el modelo."""
 
+import copy
 import sys
 from pathlib import Path
 from time import perf_counter
+
+import torch
+
+try:
+    torch.multiprocessing.set_sharing_strategy("file_system")
+except (AttributeError, RuntimeError):
+    pass
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
@@ -25,6 +33,7 @@ from src.experiments_config.config import RESULTS_DIR
 from src.results_utils import (
     build_loader,
     evaluate_classification_metrics,
+    freeze_backbone_keep_head_trainable,
     load_reference_model,
     remove_output_class,
     set_seed,
@@ -65,6 +74,7 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         model_name=model_name,
         modified_class=args.modified_class,
         update_type=args.update_type,
+        train_percentage=args.porc,
     )
     metrics_path = experiment_dir / "final_metrics.json"
     if metrics_path.exists() and not args.overwrite:
@@ -80,8 +90,24 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         model_name=model_name,
         num_classes=len(classes),
     )
+    teacher_model = copy.deepcopy(model)
+    teacher_model.eval()
+    for parameter in teacher_model.parameters():
+        parameter.requires_grad = False
+
+    student_class_indices = None
+    teacher_class_indices = None
     if args.update_type == "remove":
         remove_output_class(model, setup["modified_class_idx_original"])
+        teacher_class_indices = [
+            idx for idx in range(len(classes)) if idx != int(setup["modified_class_idx_original"])
+        ]
+        student_class_indices = list(range(len(setup["active_classes"])))
+    else:
+        common_num_classes = min(len(classes), len(setup["active_classes"]))
+        teacher_class_indices = list(range(common_num_classes))
+        student_class_indices = list(range(common_num_classes))
+    freeze_backbone_keep_head_trainable(model)
 
     distance_loader = build_loader(
         IndexedDataset(setup["distance_train_dataset"]),
@@ -123,10 +149,15 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         modified_class_idx=setup["modified_class_idx_original"],
         neighbour_class_indices=neighbour_class_indices,
         class_centroids=centroid_map,
-        samples_per_modified_class=args.samples_per_modified_class,
-        samples_per_neighbour_class=args.samples_per_neighbour_class,
-        memory_samples_per_far_class=args.memory_samples_per_far_class,
+        target_percentage=args.porc,
+        train_dataset_size=len(setup["train_active"]),
+        modified_class_weight=args.samples_per_modified_class,
+        neighbour_class_weight=args.samples_per_neighbour_class,
+        far_class_weight=args.memory_samples_per_far_class,
         selection_strategy=args.selection_strategy,
+        score_alpha=args.score_alpha,
+        score_beta=args.score_beta,
+        score_gamma=args.score_gamma,
         seed=args.seed,
         update_type=args.update_type,
     )
@@ -176,8 +207,13 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         val_loader,
         epochs=args.epochs,
         lr=args.learning_rate,
-        patience=None,
+        patience=args.patience,
         checkpoint_path=None,
+        teacher_model=teacher_model,
+        distillation_weight=args.distillation_weight,
+        distillation_temperature=args.distillation_temperature,
+        student_class_indices=student_class_indices,
+        teacher_class_indices=teacher_class_indices,
         verbose=True,
     )
     finetuning_time = perf_counter() - finetuning_start

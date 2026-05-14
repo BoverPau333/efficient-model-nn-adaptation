@@ -1,5 +1,6 @@
 name: tfg
 channels:
+  - pytorch
   - conda-forge
 dependencies:
   - python=3.10
@@ -9,3 +10,5 @@ dependencies:
   - seaborn
   - pandas
   - scikit-learn
+  - pytorch
+  - torchvision

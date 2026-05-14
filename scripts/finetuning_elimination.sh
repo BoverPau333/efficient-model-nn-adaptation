@@ -21,6 +21,7 @@ for porc in "${PORCS[@]}"; do
     "$ENV_PY" -m experiments.finetuning_retrain_after_class_removal \
         --all-datasets \
         --overwrite \
+        --output-dir /mnt/homeGPU/pbovera/results/class_removal_frozen_backbone_head \
         --porc "$porc"
 done
 
@@ -29,6 +30,7 @@ for porc in "${PORCS[@]}"; do
     "$ENV_PY" -m experiments.finetuning_retrain_after_class_removal \
         --all-datasets \
         --overwrite \
+        --output-dir /mnt/homeGPU/pbovera/results/class_removal_finetuning \
         --porc "$porc" \
         --two-stage-finetuning
 done
