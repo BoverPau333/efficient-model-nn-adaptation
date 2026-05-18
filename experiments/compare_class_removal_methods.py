@@ -8,7 +8,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src.class_removal_method_comparison import (
+from src.analysis.class_removal_method_comparison import (
     filter_completed_rows,
     load_all_method_rows,
     plot_method_comparison,

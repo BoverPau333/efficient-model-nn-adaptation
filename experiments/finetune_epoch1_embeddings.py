@@ -19,13 +19,13 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src.class_distance import compute_class_centroids, compute_distance_matrix, get_nearest_classes
+from src.core.class_distance import compute_class_centroids, compute_distance_matrix, get_nearest_classes
 from src.dataset.loaders import DATASET_LOADERS
-from src.dynamic_dataset_selection import (
+from src.adaptation.dynamic_dataset_selection import (
     RemappedSubset,
     select_dynamic_subset,
 )
-from src.dynamic_finetuning_utils import (
+from src.adaptation.dynamic_finetuning_utils import (
     build_dynamic_arg_parser,
     build_experiment_dir,
     finalize_dynamic_experiment,
@@ -34,9 +34,9 @@ from src.dynamic_finetuning_utils import (
     prepare_update_datasets,
     run_dynamic_experiment_suite,
 )
-from src.embedding_utils import IndexedDataset, extract_embeddings
+from src.core.embedding_utils import IndexedDataset, extract_embeddings
 from src.experiments_config.config import DEVICE, RESULTS_DIR
-from src.results_utils import (
+from src.core.results_utils import (
     build_loader,
     evaluate_classification_metrics,
     freeze_backbone_keep_head_trainable,
@@ -44,12 +44,20 @@ from src.results_utils import (
     remove_output_class,
     set_seed,
 )
-from src.training import compute_distillation_loss, train_with_early_stopping
+from src.core.training import compute_distillation_loss, train_with_early_stopping
 
 
 METHOD_NAME = "epoch1_embeddings_dynamic_finetune"
 EMBEDDING_STRATEGY = "captured_during_first_epoch"
 DEFAULT_OUTPUT_DIR = RESULTS_DIR / "dynamic_embedding_finetuning" / METHOD_NAME
+
+
+def log_progress(dataset_name: str, model_name: str, modified_class, message: str):
+    """Imprime una traza con contexto para seguir el avance del experimento."""
+    print(
+        f"[{METHOD_NAME}] dataset={dataset_name} | model={model_name} | modified_class={modified_class} | {message}",
+        flush=True,
+    )
 
 
 def parse_args():
@@ -168,7 +176,14 @@ def train_first_epoch_with_capture(
 
 def run_single_experiment(dataset_name: str, model_name: str, args, base_output_dir: Path):
     """Ejecuta una configuracion concreta."""
+    log_progress(dataset_name, model_name, args.modified_class, "starting experiment")
     train_ds, val_ds, test_ds, classes = DATASET_LOADERS[dataset_name]()
+    log_progress(
+        dataset_name,
+        model_name,
+        args.modified_class,
+        f"datasets loaded | train={len(train_ds)} | val={len(val_ds)} | test={len(test_ds)}",
+    )
     modified_class = parse_class_identifier(args.modified_class)
     setup = prepare_update_datasets(
         train_ds=train_ds,
@@ -181,6 +196,12 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
     inverse_label_mapping = None
     if setup["label_mapping_after_removal"] is not None:
         inverse_label_mapping = {int(new): int(old) for old, new in setup["label_mapping_after_removal"].items()}
+    log_progress(
+        dataset_name,
+        model_name,
+        args.modified_class,
+        f"active split prepared | active_train={len(setup['train_active'])} | final_classes={len(setup['active_classes'])}",
+    )
 
     experiment_dir = build_experiment_dir(
         base_output_dir=base_output_dir,
@@ -192,17 +213,25 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
     )
     metrics_path = experiment_dir / "final_metrics.json"
     if metrics_path.exists() and not args.overwrite:
+        log_progress(dataset_name, model_name, args.modified_class, f"skipping existing run at {experiment_dir}")
         return load_existing_dynamic_summary(metrics_path)
 
     experiment_dir.mkdir(parents=True, exist_ok=True)
     set_seed(args.seed)
     total_start = perf_counter()
+    log_progress(dataset_name, model_name, args.modified_class, "loading reference model")
 
     model, reference_metrics, checkpoint_path, reference_metrics_path = load_reference_model(
         reference_dir=Path(args.reference_dir),
         dataset_name=dataset_name,
         model_name=model_name,
         num_classes=len(classes),
+    )
+    log_progress(
+        dataset_name,
+        model_name,
+        args.modified_class,
+        f"reference model loaded | checkpoint={checkpoint_path}",
     )
     teacher_model = copy.deepcopy(model)
     teacher_model.eval()
@@ -222,6 +251,7 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         teacher_class_indices = list(range(common_num_classes))
         student_class_indices = list(range(common_num_classes))
     freeze_backbone_keep_head_trainable(model)
+    log_progress(dataset_name, model_name, args.modified_class, "backbone frozen, head ready for fine-tuning")
 
     initial_selection_start = perf_counter()
     distance_loader = build_loader(
@@ -231,7 +261,14 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         num_workers=args.num_workers,
         seed=args.seed,
     )
+    log_progress(
+        dataset_name,
+        model_name,
+        args.modified_class,
+        f"distance loader built | samples={len(setup['distance_train_dataset'])} | batch_size={args.batch_size}",
+    )
     initial_embedding_start = perf_counter()
+    log_progress(dataset_name, model_name, args.modified_class, "starting initial embedding extraction")
     initial_extracted = extract_embeddings(
         model,
         distance_loader,
@@ -239,6 +276,12 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         use_grad=False,
     )
     embedding_time = perf_counter() - initial_embedding_start
+    log_progress(
+        dataset_name,
+        model_name,
+        args.modified_class,
+        f"initial embedding extraction completed in {embedding_time:.1f}s | vectors={len(initial_extracted['labels'])}",
+    )
 
     normalize_centroids = args.distance_metric == "cosine"
     initial_centroid_classes, initial_centroids = compute_class_centroids(
@@ -277,8 +320,15 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         score_gamma=args.score_gamma,
         seed=args.seed,
         update_type=args.update_type,
+        progress_label=f"{METHOD_NAME} initial | dataset={dataset_name} | model={model_name} | modified_class={args.modified_class}",
     )
     initial_selection_time = perf_counter() - initial_selection_start
+    log_progress(
+        dataset_name,
+        model_name,
+        args.modified_class,
+        f"initial subset selection completed in {initial_selection_time:.1f}s | selected={len(initial_subset.indices)}",
+    )
     if args.update_type == "remove":
         initial_train_subset = RemappedSubset(
             train_ds,
@@ -315,8 +365,15 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         num_workers=args.num_workers,
         seed=args.seed,
     )
+    log_progress(
+        dataset_name,
+        model_name,
+        args.modified_class,
+        f"initial train loader ready | selected_train={len(initial_train_subset)} | val={len(setup['val_active'])} | test={len(setup['test_active'])}",
+    )
 
     first_epoch_start = perf_counter()
+    log_progress(dataset_name, model_name, args.modified_class, "starting first epoch with capture")
     first_epoch_result = train_first_epoch_with_capture(
         model,
         initial_train_loader,
@@ -329,7 +386,19 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         teacher_class_indices=teacher_class_indices,
     )
     first_epoch_time = perf_counter() - first_epoch_start
+    log_progress(
+        dataset_name,
+        model_name,
+        args.modified_class,
+        f"first epoch with capture completed in {first_epoch_time:.1f}s | captured={len(first_epoch_result['labels'])}",
+    )
     validation_after_first = evaluate_loader_loss(model, val_loader)
+    log_progress(
+        dataset_name,
+        model_name,
+        args.modified_class,
+        f"validation after first epoch | val_loss={validation_after_first['val_loss']:.4f} | val_acc={validation_after_first['val_accuracy']:.4f}",
+    )
     history_rows = [
         {
             "epoch": 1,
@@ -343,6 +412,7 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         }
     ]
     selection_start = perf_counter()
+    log_progress(dataset_name, model_name, args.modified_class, "starting focused subset rebuild from captured embeddings")
 
     captured_embeddings = first_epoch_result["vectors"]
     captured_labels = first_epoch_result["labels"]
@@ -370,6 +440,12 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
                 use_grad=False,
             )
             embedding_time += perf_counter() - supplement_start
+            log_progress(
+                dataset_name,
+                model_name,
+                args.modified_class,
+                f"removed-class embedding supplement completed in {perf_counter() - supplement_start:.1f}s | extra_vectors={len(removed_embeddings['labels'])}",
+            )
             original_ids = np.concatenate([original_ids, np.asarray([removed_only_indices[int(idx)] for idx in removed_embeddings["ids"]], dtype=int)])
             original_labels = np.concatenate([original_labels, removed_embeddings["labels"]])
             captured_embeddings = np.concatenate([captured_embeddings, removed_embeddings["vectors"]], axis=0)
@@ -411,8 +487,15 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         score_gamma=args.score_gamma,
         seed=args.seed,
         update_type=args.update_type,
+        progress_label=f"{METHOD_NAME} focused | dataset={dataset_name} | model={model_name} | modified_class={args.modified_class}",
     )
     selection_time = initial_selection_time + (perf_counter() - selection_start)
+    log_progress(
+        dataset_name,
+        model_name,
+        args.modified_class,
+        f"focused subset rebuild completed | cumulative_selection_time={selection_time:.1f}s | selected={len(selected_subset.indices)}",
+    )
     selection_details["initial_selection"] = initial_selection_details
 
     if args.update_type == "remove":
@@ -433,6 +516,12 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
     remaining_epochs = max(args.epochs - 1, 0)
     finetuning_start = perf_counter()
     if remaining_epochs > 0:
+        log_progress(
+            dataset_name,
+            model_name,
+            args.modified_class,
+            f"starting focused fine-tuning for remaining_epochs={remaining_epochs}",
+        )
         focused_train_loader = build_loader(
             selected_train,
             batch_size=args.batch_size,
@@ -454,6 +543,12 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
             student_class_indices=student_class_indices,
             teacher_class_indices=teacher_class_indices,
             verbose=True,
+        )
+        log_progress(
+            dataset_name,
+            model_name,
+            args.modified_class,
+            f"focused fine-tuning completed | epochs_ran={remaining_result['epochs_ran']} | best_epoch={remaining_result['best_epoch']}",
         )
         for epoch_info in remaining_result["history"]:
             history_rows.append(
@@ -477,11 +572,24 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         best_val_accuracy = float(validation_after_first["val_accuracy"])
         epochs_ran = 1
     finetuning_time = perf_counter() - finetuning_start + first_epoch_time
+    log_progress(
+        dataset_name,
+        model_name,
+        args.modified_class,
+        f"training pipeline completed in {finetuning_time:.1f}s | epochs_ran={epochs_ran} | best_epoch={best_epoch}",
+    )
 
     evaluation_start = perf_counter()
+    log_progress(dataset_name, model_name, args.modified_class, "starting final evaluation")
     evaluation_metrics = evaluate_classification_metrics(model, test_loader, setup["active_classes"])
     evaluation_time = perf_counter() - evaluation_start
     total_time = perf_counter() - total_start
+    log_progress(
+        dataset_name,
+        model_name,
+        args.modified_class,
+        f"evaluation completed in {evaluation_time:.1f}s | accuracy={evaluation_metrics['accuracy']:.4f} | total_time={total_time:.1f}s",
+    )
 
     return finalize_dynamic_experiment(
         dataset_name=dataset_name,

@@ -135,39 +135,41 @@ def _select_neighbour_by_composite_score(
         return [], []
 
     sample_ids = np.asarray(sample_ids, dtype=int)
-    embeddings = np.asarray(embeddings, dtype=float)
+    embeddings = np.asarray(embeddings, dtype=np.float32)
     limit = min(int(num_samples), len(sample_ids))
     if limit <= 0:
         return [], []
 
+    modified_centroid = np.asarray(modified_centroid, dtype=np.float32)
+    own_centroid = np.asarray(own_centroid, dtype=np.float32)
     closeness_to_modified = _normalize_closeness(
-        np.linalg.norm(embeddings - np.asarray(modified_centroid, dtype=float)[None, :], axis=1)
+        np.linalg.norm(embeddings - modified_centroid[None, :], axis=1)
     )
     closeness_to_own = _normalize_closeness(
-        np.linalg.norm(embeddings - np.asarray(own_centroid, dtype=float)[None, :], axis=1)
+        np.linalg.norm(embeddings - own_centroid[None, :], axis=1)
     )
 
     selected_positions = []
     score_rows = []
-    remaining_positions = list(range(len(sample_ids)))
+    selected_mask = np.zeros(len(sample_ids), dtype=bool)
+    min_distances_to_selected = np.full(len(sample_ids), np.inf, dtype=np.float32)
 
-    while remaining_positions and len(selected_positions) < limit:
+    while len(selected_positions) < limit:
+        remaining_positions = np.flatnonzero(~selected_mask)
+        if remaining_positions.size == 0:
+            break
+
         if not selected_positions or gamma <= 0.0:
-            diversity = np.ones(len(remaining_positions), dtype=float)
+            diversity = np.ones(remaining_positions.size, dtype=np.float32)
         else:
-            selected_embeddings = embeddings[selected_positions]
-            candidate_embeddings = embeddings[remaining_positions]
-            min_distances = np.min(
-                np.linalg.norm(candidate_embeddings[:, None, :] - selected_embeddings[None, :, :], axis=2),
-                axis=1,
-            )
-            diversity = _normalize_closeness(-min_distances)
+            diversity = _normalize_closeness(-min_distances_to_selected[remaining_positions])
 
         candidate_modified = closeness_to_modified[remaining_positions]
         candidate_own = closeness_to_own[remaining_positions]
         combined_scores = (alpha * candidate_modified) + (beta * candidate_own) + (gamma * diversity)
         best_local_idx = int(np.argmax(combined_scores))
-        best_pos = int(remaining_positions.pop(best_local_idx))
+        best_pos = int(remaining_positions[best_local_idx])
+        selected_mask[best_pos] = True
         selected_positions.append(best_pos)
         score_rows.append(
             {
@@ -179,7 +181,18 @@ def _select_neighbour_by_composite_score(
             }
         )
 
+        if len(selected_positions) < limit and gamma > 0.0:
+            distances_to_new = np.linalg.norm(embeddings - embeddings[best_pos][None, :], axis=1)
+            min_distances_to_selected = np.minimum(min_distances_to_selected, distances_to_new)
+
     return [int(sample_ids[pos]) for pos in selected_positions], score_rows
+
+
+def _log_selection(progress_label: str | None, message: str):
+    """Emite trazas de progreso para la fase de seleccion si se solicita."""
+    if not progress_label:
+        return
+    print(f"[dynamic_selection] {progress_label} | {message}", flush=True)
 
 
 def compute_selection_target_size(dataset_size: int, percentage: float) -> int:
@@ -257,6 +270,7 @@ def select_dynamic_subset(
     score_gamma: float,
     seed: int,
     update_type: str,
+    progress_label: str | None = None,
 ):
     """Selecciona un subconjunto focalizado en la clase modificada y sus vecinas."""
     embeddings = np.asarray(embeddings, dtype=float)
@@ -282,6 +296,10 @@ def select_dynamic_subset(
     ]
     target_num_samples = compute_selection_target_size(train_dataset_size, target_percentage)
     details["target_num_samples"] = int(target_num_samples)
+    _log_selection(
+        progress_label,
+        f"target_num_samples={target_num_samples} | neighbours={list(map(int, neighbour_class_indices))} | far_classes={len(far_classes)}",
+    )
 
     desired_far_per_class = max(int(far_class_weight), 0)
     far_entries = [
@@ -315,6 +333,10 @@ def select_dynamic_subset(
     class_budgets.update(far_budgets)
     class_budgets.update(neighbour_budgets)
     details["allocated_per_class"] = {str(key): int(value) for key, value in class_budgets.items() if value > 0}
+    _log_selection(
+        progress_label,
+        f"class budgets prepared | allocated_classes={len(details['allocated_per_class'])}",
+    )
 
     modified_mask = labels == int(modified_class_idx)
     if modified_mask.any() and update_type != "remove":
@@ -340,24 +362,39 @@ def select_dynamic_subset(
         if selection_strategy == "frontier":
             distance_to_own = np.linalg.norm(neighbour_embeddings - own_centroid[None, :], axis=1)
             distances = distance_to_modified - distance_to_own
+            chosen = _select_closest(neighbour_ids, distances, class_budgets.get(int(neighbour_class_idx), 0))
+            score_rows = []
+            strategy_used = "frontier"
+        elif selection_strategy == "nearest_to_modified":
+            chosen = _select_closest(
+                neighbour_ids,
+                distance_to_modified,
+                class_budgets.get(int(neighbour_class_idx), 0),
+            )
+            score_rows = []
+            strategy_used = "nearest_to_modified"
         else:
-            distances = distance_to_modified
-
+            neighbour_budget = class_budgets.get(int(neighbour_class_idx), 0)
+            chosen, score_rows = _select_neighbour_by_composite_score(
+                sample_ids=neighbour_ids,
+                embeddings=neighbour_embeddings,
+                modified_centroid=modified_centroid,
+                own_centroid=own_centroid,
+                num_samples=neighbour_budget,
+                alpha=score_alpha,
+                beta=score_beta,
+                gamma=score_gamma,
+            )
+            strategy_used = "composite_score"
         neighbour_budget = class_budgets.get(int(neighbour_class_idx), 0)
-        chosen, score_rows = _select_neighbour_by_composite_score(
-            sample_ids=neighbour_ids,
-            embeddings=neighbour_embeddings,
-            modified_centroid=modified_centroid,
-            own_centroid=own_centroid,
-            num_samples=neighbour_budget,
-            alpha=score_alpha,
-            beta=score_beta,
-            gamma=score_gamma,
-        )
         selected_ids.update(chosen)
+        _log_selection(
+            progress_label,
+            f"neighbour class={int(neighbour_class_idx)} | strategy={strategy_used} | budget={neighbour_budget} | selected={len(chosen)}",
+        )
         details["neighbour_class_samples"][str(neighbour_class_idx)] = {
             "budget": int(neighbour_budget),
-            "strategy": "composite_score",
+            "strategy": strategy_used,
             "weights": {
                 "alpha": float(score_alpha),
                 "beta": float(score_beta),
@@ -385,10 +422,15 @@ def select_dynamic_subset(
             anchor=own_centroid,
         )
         selected_ids.update(chosen)
+        _log_selection(
+            progress_label,
+            f"memory class={int(far_class_idx)} | budget={budget} | selected={len(chosen)}",
+        )
         details["memory_class_samples"][str(far_class_idx)] = {
             "diversity": chosen,
             "budget": int(budget),
         }
 
     selected_indices = sorted(selected_ids)
+    _log_selection(progress_label, f"selection completed | total_selected={len(selected_indices)}")
     return Subset(dataset, selected_indices), details

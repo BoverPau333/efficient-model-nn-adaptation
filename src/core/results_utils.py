@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from sklearn.metrics import f1_score
+from sklearn.metrics import confusion_matrix, f1_score
 from torch.utils.data import DataLoader
 
 from src.experiments_config.config import DEVICE
@@ -111,6 +111,16 @@ def evaluate_prediction_confidence(model, loader) -> float:
     return float(np.mean(confidences))
 
 
+def evaluate_prediction_confidence_from_probabilities(probabilities) -> float:
+    """Calcula la confianza media max-softmax a partir de probabilidades ya dadas."""
+    probabilities = np.asarray(probabilities, dtype=float)
+    if probabilities.size == 0:
+        return 0.0
+    if probabilities.ndim != 2:
+        raise ValueError(f"Expected a 2D probability array, got shape {probabilities.shape}")
+    return float(np.mean(np.max(probabilities, axis=1)))
+
+
 def compute_forgetting_from_reference(reference_per_class_accuracy: dict, current_per_class_accuracy: dict):
     """Calcula el forgetting medio frente al entrenamiento de referencia."""
     if reference_per_class_accuracy is None or current_per_class_accuracy is None:
@@ -133,6 +143,33 @@ def compute_forgetting_from_reference(reference_per_class_accuracy: dict, curren
     return float(np.mean(degradations))
 
 
+def evaluate_classification_predictions(predictions, labels, class_names: list):
+    """Evalua accuracy, F1, matriz de confusion y accuracy por clase desde arrays."""
+    all_preds = np.asarray(predictions)
+    all_labels = np.asarray(labels)
+    num_classes = len(class_names)
+    per_class_accuracy = {}
+    for class_idx, class_name in enumerate(class_names):
+        mask = all_labels == class_idx
+        per_class_accuracy[class_name] = float((all_preds[mask] == all_labels[mask]).mean()) if mask.any() else 0.0
+
+    accuracy = float((all_preds == all_labels).mean()) if len(all_labels) else 0.0
+    return {
+        "accuracy": accuracy,
+        "f1_macro": float(f1_score(all_labels, all_preds, average="macro", zero_division=0)),
+        "f1_weighted": float(f1_score(all_labels, all_preds, average="weighted", zero_division=0)),
+        "confusion_matrix": confusion_matrix(
+            all_labels,
+            all_preds,
+            labels=list(range(num_classes)),
+        ).tolist(),
+        "per_class_accuracy": per_class_accuracy,
+        "labels": all_labels.tolist(),
+        "predictions": all_preds.tolist(),
+        "mean_per_class_accuracy": float(np.mean(list(per_class_accuracy.values()))) if per_class_accuracy else 0.0,
+    }
+
+
 def evaluate_classification_metrics(model, loader, class_names: list):
     """Evalua accuracy, F1 y accuracy por clase."""
     model.eval()
@@ -147,24 +184,7 @@ def evaluate_classification_metrics(model, loader, class_names: list):
             all_preds.extend(preds.tolist())
             all_labels.extend(labels.cpu().numpy().tolist())
 
-    all_preds = np.asarray(all_preds)
-    all_labels = np.asarray(all_labels)
-    num_classes = len(class_names)
-    per_class_accuracy = {}
-    for class_idx, class_name in enumerate(class_names):
-        mask = all_labels == class_idx
-        per_class_accuracy[class_name] = float((all_preds[mask] == all_labels[mask]).mean()) if mask.any() else 0.0
-
-    accuracy = float((all_preds == all_labels).mean()) if len(all_labels) else 0.0
-    return {
-        "accuracy": accuracy,
-        "f1_macro": float(f1_score(all_labels, all_preds, average="macro", zero_division=0)),
-        "f1_weighted": float(f1_score(all_labels, all_preds, average="weighted", zero_division=0)),
-        "per_class_accuracy": per_class_accuracy,
-        "labels": all_labels.tolist(),
-        "predictions": all_preds.tolist(),
-        "mean_per_class_accuracy": float(np.mean(list(per_class_accuracy.values()))) if per_class_accuracy else 0.0,
-    }
+    return evaluate_classification_predictions(all_preds, all_labels, class_names)
 
 
 def _get_linear_head(model):

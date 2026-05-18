@@ -5,7 +5,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-from src.results_utils import load_json, write_csv
+from src.core.results_utils import load_json, write_csv
 
 
 def _read_training_history_csv(path: Path):
@@ -25,12 +25,25 @@ def _matches_train_percentage(payload: dict, train_percentage: float | None):
     return float(payload_percentage) == float(train_percentage)
 
 
-def collect_dynamic_results(results_root: Path, train_percentage: float | None = None):
+def _matches_path_variant(path: Path, variant: str | None):
+    """Filtra resultados por un fragmento de ruta opcional."""
+    if not variant:
+        return True
+    return variant in path.parts
+
+
+def collect_dynamic_results(
+    results_root: Path,
+    train_percentage: float | None = None,
+    variant: str | None = None,
+):
     """Recoge ejecuciones completadas y fallidas desde disco."""
     completed_rows = []
     failed_rows = []
 
     for metrics_path in sorted(results_root.glob("**/final_metrics.json")):
+        if not _matches_path_variant(metrics_path, variant):
+            continue
         metrics = load_json(metrics_path)
         if not _matches_train_percentage(metrics, train_percentage):
             continue
@@ -62,6 +75,8 @@ def collect_dynamic_results(results_root: Path, train_percentage: float | None =
         )
 
     for error_path in sorted(results_root.glob("**/error.json")):
+        if not _matches_path_variant(error_path, variant):
+            continue
         error_payload = load_json(error_path)
         if not _matches_train_percentage(error_payload, train_percentage):
             continue

@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import Subset
 
 from src.experiments_config.class_removal_baseline_config import CLASSES_TO_REMOVE_BY_DATASET
-from src.results_utils import parse_class_identifier
+from src.core.results_utils import parse_class_identifier
 
 
 def format_percentage_slug(percentage: float) -> str:

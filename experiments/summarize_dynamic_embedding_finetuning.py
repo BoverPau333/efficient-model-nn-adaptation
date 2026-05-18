@@ -8,7 +8,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src.dynamic_embedding_analysis import (
+from src.analysis.dynamic_embedding_analysis import (
     aggregate_learning_curves,
     build_method_dataset_summary,
     collect_dynamic_results,
@@ -39,6 +39,11 @@ def parse_args():
         default=None,
         help="Filtra el analisis para incluir solo ejecuciones con este porcentaje de train.",
     )
+    parser.add_argument(
+        "--variant",
+        default=None,
+        help="Filtra solo resultados cuya ruta contenga esta subcarpeta, por ejemplo 'early_stopping'.",
+    )
     return parser.parse_args()
 
 
@@ -46,6 +51,8 @@ def main():
     args = parse_args()
     results_root = Path(args.results_dir)
     analysis_dir = results_root / "analysis"
+    if args.variant:
+        analysis_dir = analysis_dir / args.variant
     if args.train_percentage is not None:
         percentage_label = str(int(args.train_percentage)) if float(args.train_percentage).is_integer() else str(args.train_percentage)
         analysis_dir = analysis_dir / f"porc_{percentage_label}"
@@ -53,6 +60,7 @@ def main():
     completed_rows, failed_rows = collect_dynamic_results(
         results_root,
         train_percentage=args.train_percentage,
+        variant=args.variant,
     )
     if not completed_rows and not failed_rows:
         raise FileNotFoundError(f"No dynamic embedding results found under '{results_root}'")

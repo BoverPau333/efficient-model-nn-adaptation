@@ -5,7 +5,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-from src.results_utils import load_json, write_csv
+from src.core.results_utils import load_json, write_csv
 
 
 def _percentage_slug(percentage: float) -> str:

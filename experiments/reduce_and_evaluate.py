@@ -39,9 +39,9 @@ from src.experiments_config.config import BATCH_SIZE, DEVICE, NUM_WORKERS, PLOTS
 from src.dataset.loaders import DATASET_LOADERS
 from src.dataset.utils import count_examples_per_class
 from src.models import build_mobilenet
-from src.reduction import find_least_confused_class, reduce_all_classes, reduce_least_confused_class
-from src.training import evaluate, finetune
-from src.visualization import (
+from src.core.reduction import find_least_confused_class, reduce_all_classes, reduce_least_confused_class
+from src.core.training import evaluate, finetune
+from src.core.visualization import (
     plot_class_examples_bar,
     plot_least_confused_reduction,
     plot_overall_accuracy_vs_fraction,

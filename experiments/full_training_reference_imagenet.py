@@ -8,13 +8,13 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from src.class_removal_experiment_utils import total_examples_from_split_counts
+from src.adaptation.class_removal_experiment_utils import total_examples_from_split_counts
 from src.experiments_config.config import BATCH_SIZE, EPOCHS, LR, NUM_WORKERS, RESULTS_DIR, SEED
 from src.dataset.loaders import DATASET_LOADERS
 from src.dataset.utils import count_examples_per_class
 from src.metrics_elimination import METRICAS_ELIMINACION
 from src.models import IMAGENET_MODEL_BUILDERS
-from src.results_utils import (
+from src.core.results_utils import (
     build_loader,
     count_trainable_parameters,
     evaluate_prediction_confidence,
@@ -24,7 +24,7 @@ from src.results_utils import (
     slugify,
     write_csv,
 )
-from src.training import evaluate, train_with_early_stopping
+from src.core.training import evaluate, train_with_early_stopping
 
 
 DEFAULT_OUTPUT_DIR = RESULTS_DIR / "full_training_reference_imagenet"

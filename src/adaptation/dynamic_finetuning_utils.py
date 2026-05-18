@@ -5,10 +5,10 @@ import time
 import traceback
 from pathlib import Path
 
-from src.class_removal_experiment_utils import format_percentage_slug
+from src.adaptation.class_removal_experiment_utils import format_percentage_slug
 from src.dataset.utils import remove_class_and_remap, resolve_class_to_remove
 from src.experiments_config.config import BATCH_SIZE, LR, NUM_WORKERS, RESULTS_DIR, SEED
-from src.results_utils import (
+from src.core.results_utils import (
     build_dynamic_summary_row,
     compute_forgetting_from_reference,
     count_trainable_parameters,

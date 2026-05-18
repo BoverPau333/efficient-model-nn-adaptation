@@ -17,6 +17,10 @@ UPDATE_TYPE="remove"
 MODELS=("ResNet18" "MobileNetV3-Small" "EfficientNet-B0")
 EPOCHS=5
 PORC="${PORC:-10}"
+SELECTION_STRATEGY="composite_score"
+SCORE_ALPHA="${SCORE_ALPHA:-0.3}"
+SCORE_BETA="${SCORE_BETA:-0.4}"
+SCORE_GAMMA="${SCORE_GAMMA:-0.3}"
 RESULTS_BASE_DIR="/mnt/homeGPU/pbovera/results/dynamic_embedding_finetuning"
 OVERWRITE_FLAG="--overwrite"
 
@@ -25,6 +29,10 @@ COMMON_ARGS=(
     --update-type "$UPDATE_TYPE"
     --epochs "$EPOCHS"
     --porc "$PORC"
+    --selection-strategy "$SELECTION_STRATEGY"
+    --score-alpha "$SCORE_ALPHA"
+    --score-beta "$SCORE_BETA"
+    --score-gamma "$SCORE_GAMMA"
     "$OVERWRITE_FLAG"
 )
 

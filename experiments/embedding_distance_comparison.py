@@ -9,14 +9,14 @@ from torch.utils.data import DataLoader
 
 from src.experiments_config.config import BATCH_SIZE, NUM_WORKERS, PLOTS_DIR, RESULTS_DIR
 from src.dataset.loaders import DATASET_LOADERS
-from src.embeddings import extraer_embeddings_y_logits
+from src.core.embeddings import extraer_embeddings_y_logits
 from src.metricas_embeddings import (
     evaluar_metricas_embeddings,
     margen_a_centroides,
 )
 from src.models import MODEL_BUILDERS
-from src.training import finetune
-from src.visualization import tensor_to_displayable_image
+from src.core.training import finetune
+from src.core.visualization import tensor_to_displayable_image
 
 
 EMBEDDING_DISTANCE_METRICS = ["euclidean", "euclidean_normalized", "cosine"]

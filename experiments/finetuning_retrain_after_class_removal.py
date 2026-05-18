@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from src.class_removal_experiment_utils import (
+from src.adaptation.class_removal_experiment_utils import (
     format_percentage_slug,
     get_classes_to_remove,
     select_training_subset,
@@ -23,7 +23,7 @@ from src.dataset.loaders import DATASET_LOADERS
 from src.dataset.utils import count_examples_per_class, remove_class_and_remap
 from src.metrics_elimination import METRICAS_ELIMINACION
 from src.models import IMAGENET_FROZEN_HEAD_MODEL_BUILDERS
-from src.results_utils import (
+from src.core.results_utils import (
     build_loader,
     count_trainable_parameters,
     evaluate_prediction_confidence,
@@ -33,7 +33,7 @@ from src.results_utils import (
     slugify,
     write_csv,
 )
-from src.training import evaluate, train_with_early_stopping
+from src.core.training import evaluate, train_with_early_stopping
 
 
 DEFAULT_MAX_EPOCHS = 5

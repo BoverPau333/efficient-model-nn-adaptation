@@ -16,10 +16,10 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src.class_distance import compute_class_centroids, compute_distance_matrix, get_nearest_classes
+from src.core.class_distance import compute_class_centroids, compute_distance_matrix, get_nearest_classes
 from src.dataset.loaders import DATASET_LOADERS
-from src.dynamic_dataset_selection import RemappedSubset, select_dynamic_subset
-from src.dynamic_finetuning_utils import (
+from src.adaptation.dynamic_dataset_selection import RemappedSubset, select_dynamic_subset
+from src.adaptation.dynamic_finetuning_utils import (
     build_dynamic_arg_parser,
     build_experiment_dir,
     finalize_dynamic_experiment,
@@ -28,9 +28,9 @@ from src.dynamic_finetuning_utils import (
     prepare_update_datasets,
     run_dynamic_experiment_suite,
 )
-from src.embedding_utils import IndexedDataset, extract_embeddings
+from src.core.embedding_utils import IndexedDataset, extract_embeddings
 from src.experiments_config.config import RESULTS_DIR
-from src.results_utils import (
+from src.core.results_utils import (
     build_loader,
     evaluate_classification_metrics,
     freeze_backbone_keep_head_trainable,
@@ -38,12 +38,20 @@ from src.results_utils import (
     remove_output_class,
     set_seed,
 )
-from src.training import train_with_early_stopping
+from src.core.training import train_with_early_stopping
 
 
 METHOD_NAME = "precompute_embeddings_then_finetune"
 EMBEDDING_STRATEGY = "precomputed_before_finetuning"
 DEFAULT_OUTPUT_DIR = RESULTS_DIR / "dynamic_embedding_finetuning" / METHOD_NAME
+
+
+def log_progress(dataset_name: str, model_name: str, modified_class, message: str):
+    """Imprime una traza con contexto para seguir el avance del experimento."""
+    print(
+        f"[{METHOD_NAME}] dataset={dataset_name} | model={model_name} | modified_class={modified_class} | {message}",
+        flush=True,
+    )
 
 
 def parse_args():
@@ -57,7 +65,14 @@ def parse_args():
 
 def run_single_experiment(dataset_name: str, model_name: str, args, base_output_dir: Path):
     """Ejecuta una configuracion concreta."""
+    log_progress(dataset_name, model_name, args.modified_class, "starting experiment")
     train_ds, val_ds, test_ds, classes = DATASET_LOADERS[dataset_name]()
+    log_progress(
+        dataset_name,
+        model_name,
+        args.modified_class,
+        f"datasets loaded | train={len(train_ds)} | val={len(val_ds)} | test={len(test_ds)}",
+    )
     modified_class = parse_class_identifier(args.modified_class)
     setup = prepare_update_datasets(
         train_ds=train_ds,
@@ -66,6 +81,12 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         classes=classes,
         modified_class=modified_class,
         update_type=args.update_type,
+    )
+    log_progress(
+        dataset_name,
+        model_name,
+        args.modified_class,
+        f"active split prepared | active_train={len(setup['train_active'])} | final_classes={len(setup['active_classes'])}",
     )
 
     experiment_dir = build_experiment_dir(
@@ -78,17 +99,25 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
     )
     metrics_path = experiment_dir / "final_metrics.json"
     if metrics_path.exists() and not args.overwrite:
+        log_progress(dataset_name, model_name, args.modified_class, f"skipping existing run at {experiment_dir}")
         return load_existing_dynamic_summary(metrics_path)
 
     experiment_dir.mkdir(parents=True, exist_ok=True)
 
     set_seed(args.seed)
     total_start = perf_counter()
+    log_progress(dataset_name, model_name, args.modified_class, "loading reference model")
     model, reference_metrics, checkpoint_path, reference_metrics_path = load_reference_model(
         reference_dir=Path(args.reference_dir),
         dataset_name=dataset_name,
         model_name=model_name,
         num_classes=len(classes),
+    )
+    log_progress(
+        dataset_name,
+        model_name,
+        args.modified_class,
+        f"reference model loaded | checkpoint={checkpoint_path}",
     )
     teacher_model = copy.deepcopy(model)
     teacher_model.eval()
@@ -108,6 +137,7 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         teacher_class_indices = list(range(common_num_classes))
         student_class_indices = list(range(common_num_classes))
     freeze_backbone_keep_head_trainable(model)
+    log_progress(dataset_name, model_name, args.modified_class, "backbone frozen, head ready for fine-tuning")
 
     distance_loader = build_loader(
         IndexedDataset(setup["distance_train_dataset"]),
@@ -116,7 +146,14 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         num_workers=args.num_workers,
         seed=args.seed,
     )
+    log_progress(
+        dataset_name,
+        model_name,
+        args.modified_class,
+        f"distance loader built | samples={len(setup['distance_train_dataset'])} | batch_size={args.batch_size}",
+    )
     embedding_start = perf_counter()
+    log_progress(dataset_name, model_name, args.modified_class, "starting embedding extraction")
     extracted = extract_embeddings(
         model,
         distance_loader,
@@ -124,8 +161,15 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         use_grad=False,
     )
     embedding_time = perf_counter() - embedding_start
+    log_progress(
+        dataset_name,
+        model_name,
+        args.modified_class,
+        f"embedding extraction completed in {embedding_time:.1f}s | vectors={len(extracted['labels'])}",
+    )
 
     selection_start = perf_counter()
+    log_progress(dataset_name, model_name, args.modified_class, "starting dynamic subset selection")
     normalize_centroids = args.distance_metric == "cosine"
     centroid_classes, centroids = compute_class_centroids(
         extracted["vectors"],
@@ -160,8 +204,15 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         score_gamma=args.score_gamma,
         seed=args.seed,
         update_type=args.update_type,
+        progress_label=f"{METHOD_NAME} | dataset={dataset_name} | model={model_name} | modified_class={args.modified_class}",
     )
     selection_time = perf_counter() - selection_start
+    log_progress(
+        dataset_name,
+        model_name,
+        args.modified_class,
+        f"dynamic subset selection completed in {selection_time:.1f}s | selected={len(selected_subset.indices)}",
+    )
 
     if args.update_type == "remove":
         selected_train = RemappedSubset(
@@ -199,8 +250,15 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         num_workers=args.num_workers,
         seed=args.seed,
     )
+    log_progress(
+        dataset_name,
+        model_name,
+        args.modified_class,
+        f"train/val/test loaders ready | selected_train={len(selected_train)} | val={len(setup['val_active'])} | test={len(setup['test_active'])}",
+    )
 
     finetuning_start = perf_counter()
+    log_progress(dataset_name, model_name, args.modified_class, "starting fine-tuning")
     training_result = train_with_early_stopping(
         model,
         train_loader,
@@ -217,11 +275,24 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         verbose=True,
     )
     finetuning_time = perf_counter() - finetuning_start
+    log_progress(
+        dataset_name,
+        model_name,
+        args.modified_class,
+        f"fine-tuning completed in {finetuning_time:.1f}s | epochs_ran={training_result['epochs_ran']} | best_epoch={training_result['best_epoch']}",
+    )
 
     evaluation_start = perf_counter()
+    log_progress(dataset_name, model_name, args.modified_class, "starting final evaluation")
     evaluation_metrics = evaluate_classification_metrics(model, test_loader, setup["active_classes"])
     evaluation_time = perf_counter() - evaluation_start
     total_time = perf_counter() - total_start
+    log_progress(
+        dataset_name,
+        model_name,
+        args.modified_class,
+        f"evaluation completed in {evaluation_time:.1f}s | accuracy={evaluation_metrics['accuracy']:.4f} | total_time={total_time:.1f}s",
+    )
 
     return finalize_dynamic_experiment(
         dataset_name=dataset_name,

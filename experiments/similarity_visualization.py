@@ -3,8 +3,8 @@ from torch.utils.data import DataLoader
 from src.experiments_config.config import BATCH_SIZE, DEVICE, NUM_WORKERS, PLOTS_DIR
 from src.dataset.loaders import DATASET_LOADERS
 from src.models import build_mobilenet
-from src.training import evaluate, finetune
-from src.visualization import visualize_top_confused_pairs
+from src.core.training import evaluate, finetune
+from src.core.visualization import visualize_top_confused_pairs
 
 
 def run_similarity_visualization_for_dataset(ds_name: str, loader_fn, top_k=5, num_samples=5):
