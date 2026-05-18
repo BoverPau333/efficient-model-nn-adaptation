@@ -105,8 +105,7 @@ METRICAS_ELIMINACION = [
     ),
 ]
 
-# Compatibilidad hacia atras: algunos imports del paquete `src` siguen esperando
-# esta constante aunque ahora no estemos manteniendo una lista separada.
+
 METRICAS_MENOS_RELEVANTES_O_NO_APLICABLES = []
 
 
