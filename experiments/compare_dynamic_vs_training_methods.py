@@ -9,6 +9,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from src.analysis.dynamic_training_method_comparison import (
+    estimate_baseline_rows,
     load_method_rows,
     plot_dataset_comparison,
     plot_overall_comparison,
@@ -55,6 +56,7 @@ def main():
         train_percentage=args.train_percentage,
         dynamic_variant=args.dynamic_variant,
     )
+    rows.extend(estimate_baseline_rows(results_root, train_percentage=args.train_percentage))
     if not rows:
         raise FileNotFoundError(
             f"No results found under '{results_root}' for train_percentage={args.train_percentage}."

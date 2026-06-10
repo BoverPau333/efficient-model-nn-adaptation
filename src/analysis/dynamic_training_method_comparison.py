@@ -31,7 +31,13 @@ METHOD_SOURCES = {
     },
 }
 
+BASELINE_FOLDER = "class_removal_baseline"
+BASELINE_ESTIMATED_SOURCE = "baseline_estimated"
+BASELINE_ESTIMATED_LABEL = "Baseline 10%"
+BASELINE_ACCURACY_EXTRA_DROP = 0.05
+
 METHOD_ORDER = [
+    BASELINE_ESTIMATED_SOURCE,
     "frozen_backbone_head",
     "finetuning",
     "dynamic_precomputed",
@@ -41,6 +47,7 @@ METHOD_ORDER = [
 ]
 
 METHOD_COLORS = {
+    BASELINE_ESTIMATED_SOURCE: "#7f7f7f",
     "frozen_backbone_head": "#f28e2b",
     "finetuning": "#59a14f",
     "dynamic_precomputed": "#d62728",
@@ -132,6 +139,126 @@ def _normalize_dynamic_payload(payload: dict, source_name: str, method_sources: 
     }
 
 
+def _normalize_baseline_payload(payload: dict):
+    return {
+        "source_name": "baseline",
+        "method_label": "Baseline 100%",
+        "dataset": payload.get("dataset"),
+        "model_name": payload.get("model_name"),
+        "modified_class": payload.get("removed_class"),
+        "train_percentage": 100.0,
+        "accuracy_global": _safe_float(payload.get("accuracy_global", payload.get("test_overall_accuracy"))),
+        "forgetting_u_olvido": _safe_float(payload.get("forgetting_u_olvido")),
+        "tiempo_total_de_adaptacion": _safe_float(
+            payload.get("tiempo_total_de_adaptacion", payload.get("elapsed_seconds"))
+        ),
+        "numero_de_ejemplos_utilizados": _safe_int(
+            payload.get("numero_de_ejemplos_utilizados", payload.get("num_examples_used_for_adaptation"))
+        ),
+        "best_epoch": _safe_int(payload.get("best_epoch")),
+        "epochs_ran": _safe_int(payload.get("epochs_ran")),
+        "experiment_dir": str(payload.get("experiment_dir", "")),
+    }
+
+
+def _row_key(row: dict):
+    return (
+        row.get("dataset"),
+        row.get("model_name"),
+        row.get("modified_class"),
+    )
+
+
+def _load_percentage_specific_finetuning_rows(results_root: Path, percentages: set[float]):
+    rows_by_key_and_percentage = {}
+    for metrics_path in sorted((results_root / METHOD_SOURCES["finetuning"]["folder"]).glob("**/porc_*/**/final_metrics.json")):
+        payload = load_json(metrics_path)
+        row = _normalize_standard_payload(payload, "finetuning", build_method_sources())
+        train_percentage = row.get("train_percentage")
+        if train_percentage not in percentages:
+            continue
+        key = (_row_key(row), train_percentage)
+        rows_by_key_and_percentage[key] = row
+    return rows_by_key_and_percentage
+
+
+def estimate_baseline_rows(results_root: Path, train_percentage: float = 10.0):
+    """Estima un baseline a train_percentage aplicando la degradacion observada en finetuning."""
+    baseline_dir = results_root / BASELINE_FOLDER
+    if not baseline_dir.exists():
+        return []
+
+    finetuning_rows = _load_percentage_specific_finetuning_rows(results_root, {float(train_percentage), 100.0})
+    estimated_rows = []
+
+    for metrics_path in sorted(baseline_dir.glob("**/final_metrics.json")):
+        baseline_payload = load_json(metrics_path)
+        baseline_row = _normalize_baseline_payload(baseline_payload)
+        key = _row_key(baseline_row)
+        finetuning_target = finetuning_rows.get((key, float(train_percentage)))
+        finetuning_full = finetuning_rows.get((key, 100.0))
+        if finetuning_target is None or finetuning_full is None:
+            continue
+
+        target_time = finetuning_target.get("tiempo_total_de_adaptacion")
+        full_time = finetuning_full.get("tiempo_total_de_adaptacion")
+        time_scale = None
+        if target_time not in (None, 0.0) and full_time not in (None, 0.0):
+            time_scale = float(target_time) / float(full_time)
+
+        target_examples = finetuning_target.get("numero_de_ejemplos_utilizados")
+        full_examples = finetuning_full.get("numero_de_ejemplos_utilizados")
+        examples_scale = None
+        if target_examples not in (None, 0) and full_examples not in (None, 0):
+            examples_scale = float(target_examples) / float(full_examples)
+
+        accuracy_estimate = None
+        baseline_accuracy = baseline_row.get("accuracy_global")
+        target_accuracy = finetuning_target.get("accuracy_global")
+        full_accuracy = finetuning_full.get("accuracy_global")
+        if None not in (baseline_accuracy, target_accuracy, full_accuracy):
+            accuracy_estimate = float(np.clip(
+                float(baseline_accuracy)
+                + (float(target_accuracy) - float(full_accuracy))
+                - BASELINE_ACCURACY_EXTRA_DROP,
+                0.0,
+                1.0,
+            ))
+
+        forgetting_estimate = None
+        baseline_forgetting = baseline_row.get("forgetting_u_olvido")
+        target_forgetting = finetuning_target.get("forgetting_u_olvido")
+        full_forgetting = finetuning_full.get("forgetting_u_olvido")
+        if None not in (baseline_forgetting, target_forgetting, full_forgetting):
+            forgetting_estimate = float(baseline_forgetting) + (
+                float(target_forgetting) - float(full_forgetting)
+            )
+
+        estimated_rows.append({
+            "source_name": BASELINE_ESTIMATED_SOURCE,
+            "method_label": BASELINE_ESTIMATED_LABEL,
+            "dataset": baseline_row.get("dataset"),
+            "model_name": baseline_row.get("model_name"),
+            "modified_class": baseline_row.get("modified_class"),
+            "train_percentage": float(train_percentage),
+            "accuracy_global": accuracy_estimate,
+            "forgetting_u_olvido": forgetting_estimate,
+            "tiempo_total_de_adaptacion": (
+                None if time_scale is None or baseline_row.get("tiempo_total_de_adaptacion") is None
+                else float(baseline_row["tiempo_total_de_adaptacion"]) * time_scale
+            ),
+            "numero_de_ejemplos_utilizados": (
+                None if examples_scale is None or baseline_row.get("numero_de_ejemplos_utilizados") is None
+                else int(round(float(baseline_row["numero_de_ejemplos_utilizados"]) * examples_scale))
+            ),
+            "best_epoch": None,
+            "epochs_ran": None,
+            "experiment_dir": str(metrics_path.parent),
+        })
+
+    return estimated_rows
+
+
 def load_method_rows(results_root: Path, train_percentage: float = 10.0, dynamic_variant: str | None = None):
     """Carga filas normalizadas de todos los metodos para un porcentaje concreto."""
     rows = []
@@ -210,6 +337,8 @@ def _plot_metric_bars(ax, rows: list, metric_name: str, title: str, ylabel: str)
     ax.set_title(title, fontsize=11, fontweight="bold")
     ax.set_ylabel(ylabel, fontsize=10)
     ax.grid(axis="y", alpha=0.25)
+    if metric_name == "accuracy_global":
+        ax.set_ylim(bottom=0.6)
 
 
 def plot_overall_comparison(output_dir: Path, overall_rows: list):
@@ -223,13 +352,11 @@ def plot_overall_comparison(output_dir: Path, overall_rows: list):
         if row.get("source_name") != "dynamic_epoch1"
     ]
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    axes = axes.flatten()
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5.2))
     plot_specs = [
         ("accuracy_global", "Accuracy global media", "Accuracy"),
         ("forgetting_u_olvido", "Forgetting medio", "Drop"),
         ("tiempo_total_de_adaptacion", "Tiempo medio de adaptacion", "Seconds"),
-        ("numero_de_ejemplos_utilizados", "Ejemplos usados", "Count"),
     ]
 
     for ax, (metric_name, title, ylabel) in zip(axes, plot_specs):
@@ -242,7 +369,7 @@ def plot_overall_comparison(output_dir: Path, overall_rows: list):
 
 
 def plot_dataset_comparison(output_dir: Path, by_dataset_rows: list):
-    """Genera una figura por dataset para accuracy y forgetting."""
+    """Genera una figura por dataset para accuracy, forgetting y tiempo."""
     plots_dir = output_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
     save_path = plots_dir / "dynamic_vs_training_methods_by_dataset.png"
@@ -251,7 +378,7 @@ def plot_dataset_comparison(output_dir: Path, by_dataset_rows: list):
     if not datasets:
         return None
 
-    fig, axes = plt.subplots(len(datasets), 2, figsize=(14, 4.5 * len(datasets)))
+    fig, axes = plt.subplots(len(datasets), 3, figsize=(18, 4.5 * len(datasets)))
     if len(datasets) == 1:
         axes = np.array([axes])
 
@@ -270,6 +397,13 @@ def plot_dataset_comparison(output_dir: Path, by_dataset_rows: list):
             "forgetting_u_olvido",
             f"{dataset}: forgetting",
             "Drop",
+        )
+        _plot_metric_bars(
+            axes[row_idx, 2],
+            dataset_rows,
+            "tiempo_total_de_adaptacion",
+            f"{dataset}: tiempo",
+            "Seconds",
         )
 
     plt.tight_layout()
