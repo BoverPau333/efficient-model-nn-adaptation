@@ -217,6 +217,35 @@ def remove_output_class(model, removed_class_idx: int):
     return model
 
 
+def add_output_class(model, added_class_idx: int):
+    """Expande la cabecera del modelo insertando una nueva salida en un indice concreto."""
+    head_ref, head = _get_linear_head(model)
+    new_head = torch.nn.Linear(head.in_features, head.out_features + 1).to(head.weight.device)
+
+    insert_idx = int(added_class_idx)
+    if insert_idx < 0 or insert_idx > head.out_features:
+        raise ValueError(
+            f"added_class_idx must be in [0, {head.out_features}], got {insert_idx}."
+        )
+
+    with torch.no_grad():
+        if insert_idx > 0:
+            new_head.weight[:insert_idx].copy_(head.weight[:insert_idx])
+            if head.bias is not None:
+                new_head.bias[:insert_idx].copy_(head.bias[:insert_idx])
+        if insert_idx < head.out_features:
+            new_head.weight[insert_idx + 1 :].copy_(head.weight[insert_idx:])
+            if head.bias is not None:
+                new_head.bias[insert_idx + 1 :].copy_(head.bias[insert_idx:])
+
+    if head_ref == "fc":
+        model.fc = new_head
+    else:
+        _, idx = head_ref
+        model.classifier[idx] = new_head
+    return model
+
+
 def freeze_backbone_keep_head_trainable(model):
     """Congela el cuerpo del modelo y deja entrenable solo la cabecera lineal final."""
     head_ref, head = _get_linear_head(model)

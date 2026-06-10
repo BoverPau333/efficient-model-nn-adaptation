@@ -262,6 +262,7 @@ def select_dynamic_subset(
     target_percentage: float,
     train_dataset_size: int,
     modified_class_weight: int,
+    modified_class_fraction: float,
     neighbour_class_weight: int,
     far_class_weight: int,
     selection_strategy: str,
@@ -285,6 +286,7 @@ def select_dynamic_subset(
         "modified_class_samples": [],
         "neighbour_class_samples": {},
         "memory_class_samples": {},
+        "top_up_samples": [],
     }
 
     neighbour_set = {int(item) for item in neighbour_class_indices}
@@ -301,6 +303,20 @@ def select_dynamic_subset(
         f"target_num_samples={target_num_samples} | neighbours={list(map(int, neighbour_class_indices))} | far_classes={len(far_classes)}",
     )
 
+    modified_budget = 0
+    if update_type != "remove":
+        if modified_class_fraction <= 0.0 or modified_class_fraction > 1.0:
+            raise ValueError("modified_class_fraction debe estar en el intervalo (0, 1].")
+        modified_capacity = int(np.sum(labels == int(modified_class_idx)))
+        requested_fraction_budget = int(np.ceil(target_num_samples * float(modified_class_fraction)))
+        modified_budget = min(
+            max(requested_fraction_budget, int(modified_class_weight), 0),
+            modified_capacity,
+            target_num_samples,
+        )
+
+    remaining_budget = max(target_num_samples - modified_budget, 0)
+
     desired_far_per_class = max(int(far_class_weight), 0)
     far_entries = [
         {
@@ -312,12 +328,12 @@ def select_dynamic_subset(
         if desired_far_per_class > 0 and int(np.sum(labels == int(class_idx))) > 0
     ]
     far_total_budget = min(
-        target_num_samples,
+        remaining_budget,
         sum(entry["capacity"] for entry in far_entries),
     )
     far_budgets = _allocate_integer_budgets(far_total_budget, far_entries)
 
-    remaining_budget = max(target_num_samples - sum(far_budgets.values()), 0)
+    remaining_budget = max(remaining_budget - sum(far_budgets.values()), 0)
     neighbour_entries = [
         {
             "key": int(class_idx),
@@ -330,6 +346,8 @@ def select_dynamic_subset(
     neighbour_budgets = _allocate_integer_budgets(remaining_budget, neighbour_entries)
 
     class_budgets = {}
+    if modified_budget > 0:
+        class_budgets[int(modified_class_idx)] = int(modified_budget)
     class_budgets.update(far_budgets)
     class_budgets.update(neighbour_budgets)
     details["allocated_per_class"] = {str(key): int(value) for key, value in class_budgets.items() if value > 0}
@@ -431,6 +449,87 @@ def select_dynamic_subset(
             "budget": int(budget),
         }
 
+    remaining_needed = max(target_num_samples - len(selected_ids), 0)
+    if remaining_needed > 0:
+        _log_selection(
+            progress_label,
+            f"top-up required | current_selected={len(selected_ids)} | remaining_needed={remaining_needed}",
+        )
+        top_up_ids = []
+        priority_classes = []
+        if update_type != "remove":
+            priority_classes.append(int(modified_class_idx))
+        priority_classes.extend(int(class_idx) for class_idx in neighbour_class_indices)
+        priority_classes.extend(int(class_idx) for class_idx in far_classes)
+
+        for class_idx in priority_classes:
+            if remaining_needed <= 0:
+                break
+
+            class_mask = labels == int(class_idx)
+            if not class_mask.any():
+                continue
+
+            class_ids = ids[class_mask]
+            class_embeddings = embeddings[class_mask]
+            remaining_positions = [
+                pos for pos, sample_id in enumerate(class_ids.tolist())
+                if int(sample_id) not in selected_ids
+            ]
+            if not remaining_positions:
+                continue
+
+            candidate_ids = class_ids[remaining_positions]
+            candidate_embeddings = class_embeddings[remaining_positions]
+            own_centroid = np.asarray(class_centroids[int(class_idx)], dtype=float)
+
+            if int(class_idx) == int(modified_class_idx) and update_type != "remove":
+                distances = np.linalg.norm(candidate_embeddings - own_centroid[None, :], axis=1)
+                chosen = _select_closest(candidate_ids, distances, remaining_needed)
+            elif int(class_idx) in neighbour_set:
+                modified_centroid = np.asarray(class_centroids[int(modified_class_idx)], dtype=float)
+                distance_to_modified = np.linalg.norm(candidate_embeddings - modified_centroid[None, :], axis=1)
+                if selection_strategy == "frontier":
+                    distance_to_own = np.linalg.norm(candidate_embeddings - own_centroid[None, :], axis=1)
+                    distances = distance_to_modified - distance_to_own
+                    chosen = _select_closest(candidate_ids, distances, remaining_needed)
+                elif selection_strategy == "nearest_to_modified":
+                    chosen = _select_closest(candidate_ids, distance_to_modified, remaining_needed)
+                else:
+                    chosen, _ = _select_neighbour_by_composite_score(
+                        sample_ids=candidate_ids,
+                        embeddings=candidate_embeddings,
+                        modified_centroid=modified_centroid,
+                        own_centroid=own_centroid,
+                        num_samples=remaining_needed,
+                        alpha=score_alpha,
+                        beta=score_beta,
+                        gamma=score_gamma,
+                    )
+            else:
+                chosen = _select_farthest_diverse(
+                    sample_ids=candidate_ids,
+                    embeddings=candidate_embeddings,
+                    num_samples=remaining_needed,
+                    seed=seed + 5000 + int(class_idx),
+                    anchor=own_centroid,
+                )
+
+            selected_ids.update(chosen)
+            top_up_ids.extend(int(sample_id) for sample_id in chosen)
+            remaining_needed = max(target_num_samples - len(selected_ids), 0)
+
+        details["top_up_samples"] = top_up_ids
+        _log_selection(
+            progress_label,
+            f"top-up completed | added={len(top_up_ids)} | final_selected={len(selected_ids)}",
+        )
+
     selected_indices = sorted(selected_ids)
-    _log_selection(progress_label, f"selection completed | total_selected={len(selected_indices)}")
+    details["final_num_samples"] = int(len(selected_indices))
+    details["selection_reached_target"] = bool(len(selected_indices) == target_num_samples)
+    _log_selection(
+        progress_label,
+        f"selection completed | total_selected={len(selected_indices)} | target={target_num_samples}",
+    )
     return Subset(dataset, selected_indices), details

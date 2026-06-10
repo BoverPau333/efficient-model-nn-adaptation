@@ -29,6 +29,7 @@ from src.adaptation.dynamic_finetuning_utils import (
     build_dynamic_arg_parser,
     build_experiment_dir,
     finalize_dynamic_experiment,
+    load_dynamic_reference_model,
     load_existing_dynamic_summary,
     parse_class_identifier,
     prepare_update_datasets,
@@ -40,7 +41,6 @@ from src.core.results_utils import (
     build_loader,
     evaluate_classification_metrics,
     freeze_backbone_keep_head_trainable,
-    load_reference_model,
     remove_output_class,
     set_seed,
 )
@@ -221,11 +221,12 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
     total_start = perf_counter()
     log_progress(dataset_name, model_name, args.modified_class, "loading reference model")
 
-    model, reference_metrics, checkpoint_path, reference_metrics_path = load_reference_model(
-        reference_dir=Path(args.reference_dir),
+    model, reference_metrics, checkpoint_path, reference_metrics_path = load_dynamic_reference_model(
         dataset_name=dataset_name,
         model_name=model_name,
-        num_classes=len(classes),
+        args=args,
+        setup=setup,
+        classes=classes,
     )
     log_progress(
         dataset_name,
@@ -247,105 +248,16 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         ]
         student_class_indices = list(range(len(setup["active_classes"])))
     else:
-        common_num_classes = min(len(classes), len(setup["active_classes"]))
-        teacher_class_indices = list(range(common_num_classes))
-        student_class_indices = list(range(common_num_classes))
+        teacher_class_indices = [
+            idx for idx in range(len(classes)) if idx != int(setup["modified_class_idx_original"])
+        ]
+        student_class_indices = list(teacher_class_indices)
     freeze_backbone_keep_head_trainable(model)
     log_progress(dataset_name, model_name, args.modified_class, "backbone frozen, head ready for fine-tuning")
 
-    initial_selection_start = perf_counter()
-    distance_loader = build_loader(
-        IndexedDataset(setup["distance_train_dataset"]),
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        seed=args.seed,
-    )
-    log_progress(
-        dataset_name,
-        model_name,
-        args.modified_class,
-        f"distance loader built | samples={len(setup['distance_train_dataset'])} | batch_size={args.batch_size}",
-    )
-    initial_embedding_start = perf_counter()
-    log_progress(dataset_name, model_name, args.modified_class, "starting initial embedding extraction")
-    initial_extracted = extract_embeddings(
-        model,
-        distance_loader,
-        representation=args.embedding_representation,
-        use_grad=False,
-    )
-    embedding_time = perf_counter() - initial_embedding_start
-    log_progress(
-        dataset_name,
-        model_name,
-        args.modified_class,
-        f"initial embedding extraction completed in {embedding_time:.1f}s | vectors={len(initial_extracted['labels'])}",
-    )
-
-    normalize_centroids = args.distance_metric == "cosine"
-    initial_centroid_classes, initial_centroids = compute_class_centroids(
-        initial_extracted["vectors"],
-        initial_extracted["labels"],
-        normalize=normalize_centroids,
-    )
-    initial_distance_matrix = compute_distance_matrix(initial_centroids, metric=args.distance_metric)
-    initial_neighbours = get_nearest_classes(
-        initial_centroid_classes,
-        initial_distance_matrix,
-        modified_class_idx=setup["modified_class_idx_original"],
-        k_neighbours=args.k_neighbours,
-    )
-    initial_neighbour_class_indices = [item["class_idx"] for item in initial_neighbours]
-    initial_centroid_map = {
-        int(class_idx): initial_centroids[pos]
-        for pos, class_idx in enumerate(initial_centroid_classes)
-    }
-    initial_subset, initial_selection_details = select_dynamic_subset(
-        dataset=setup["distance_train_dataset"],
-        embeddings=initial_extracted["vectors"],
-        labels=initial_extracted["labels"],
-        ids=initial_extracted["ids"],
-        modified_class_idx=setup["modified_class_idx_original"],
-        neighbour_class_indices=initial_neighbour_class_indices,
-        class_centroids=initial_centroid_map,
-        target_percentage=args.porc,
-        train_dataset_size=len(setup["train_active"]),
-        modified_class_weight=args.samples_per_modified_class,
-        neighbour_class_weight=args.samples_per_neighbour_class,
-        far_class_weight=args.memory_samples_per_far_class,
-        selection_strategy=args.selection_strategy,
-        score_alpha=args.score_alpha,
-        score_beta=args.score_beta,
-        score_gamma=args.score_gamma,
-        seed=args.seed,
-        update_type=args.update_type,
-        progress_label=f"{METHOD_NAME} initial | dataset={dataset_name} | model={model_name} | modified_class={args.modified_class}",
-    )
-    initial_selection_time = perf_counter() - initial_selection_start
-    log_progress(
-        dataset_name,
-        model_name,
-        args.modified_class,
-        f"initial subset selection completed in {initial_selection_time:.1f}s | selected={len(initial_subset.indices)}",
-    )
-    if args.update_type == "remove":
-        initial_train_subset = RemappedSubset(
-            train_ds,
-            initial_subset.indices,
-            label_mapping=setup["label_mapping_after_removal"],
-            classes=setup["active_classes"],
-        )
-    else:
-        initial_train_subset = RemappedSubset(
-            train_ds,
-            initial_subset.indices,
-            label_mapping=None,
-            classes=setup["active_classes"],
-        )
-
+    initial_train_dataset = setup["train_active"]
     initial_train_loader = build_loader(
-        IndexedDataset(initial_train_subset),
+        IndexedDataset(initial_train_dataset),
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
@@ -369,7 +281,10 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         dataset_name,
         model_name,
         args.modified_class,
-        f"initial train loader ready | selected_train={len(initial_train_subset)} | val={len(setup['val_active'])} | test={len(setup['test_active'])}",
+        (
+            "initial train loader ready | using_full_train_for_epoch1=yes "
+            f"| selected_train={len(initial_train_dataset)} | val={len(setup['val_active'])} | test={len(setup['test_active'])}"
+        ),
     )
 
     first_epoch_start = perf_counter()
@@ -402,7 +317,7 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
     history_rows = [
         {
             "epoch": 1,
-            "phase": "initial_distance_guided_epoch",
+            "phase": "full_train_epoch1",
             "train_loss": float(first_epoch_result["train_loss"]),
             "train_ce_loss": float(first_epoch_result["train_ce_loss"]),
             "train_distill_loss": float(first_epoch_result["train_distill_loss"]),
@@ -419,7 +334,7 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
     captured_ids = first_epoch_result["ids"]
 
     if args.update_type == "remove":
-        original_ids = resolve_original_ids_from_subset(initial_train_subset.indices, captured_ids)
+        original_ids = resolve_original_ids_from_subset(initial_train_dataset.indices, captured_ids)
         original_labels = np.asarray([inverse_label_mapping[int(label)] for label in captured_labels], dtype=int)
 
         removed_only_indices = np.flatnonzero(np.asarray(train_ds.targets) == setup["modified_class_idx_original"]).tolist()
@@ -479,6 +394,7 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         target_percentage=args.porc,
         train_dataset_size=len(setup["train_active"]),
         modified_class_weight=args.samples_per_modified_class,
+        modified_class_fraction=args.modified_class_fraction,
         neighbour_class_weight=args.samples_per_neighbour_class,
         far_class_weight=args.memory_samples_per_far_class,
         selection_strategy=args.selection_strategy,
@@ -489,14 +405,17 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         update_type=args.update_type,
         progress_label=f"{METHOD_NAME} focused | dataset={dataset_name} | model={model_name} | modified_class={args.modified_class}",
     )
-    selection_time = initial_selection_time + (perf_counter() - selection_start)
+    selection_time = perf_counter() - selection_start
     log_progress(
         dataset_name,
         model_name,
         args.modified_class,
-        f"focused subset rebuild completed | cumulative_selection_time={selection_time:.1f}s | selected={len(selected_subset.indices)}",
+        f"focused subset rebuild completed | selection_time={selection_time:.1f}s | selected={len(selected_subset.indices)}",
     )
-    selection_details["initial_selection"] = initial_selection_details
+    selection_details["initial_selection"] = {
+        "used_full_train_for_epoch1": True,
+        "num_examples": int(len(initial_train_dataset)),
+    }
 
     if args.update_type == "remove":
         selected_train = RemappedSubset(

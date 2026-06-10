@@ -529,51 +529,175 @@ def plot_accuracy_vs_time_landscape(output_dir: Path, fewshot_summaries: list, c
     plot_dir.mkdir(parents=True, exist_ok=True)
     save_path = plot_dir / "accuracy_vs_time_landscape.png"
 
+    def _normalize_plot_row(row):
+        method = str(row.get("comparison_method") or "")
+
+        if method == "baseline":
+            return {
+                "label": "Baseline",
+                "group": "baseline",
+                "accuracy": row.get("adaptation_accuracy_global_mean"),
+                "time": row.get("adaptation_tiempo_total_de_adaptacion_mean"),
+            }
+
+        if method == "frozen_backbone_head":
+            return {
+                "label": "FT_Head 100%",
+                "group": "ft_head",
+                "accuracy": row.get("adaptation_accuracy_global_mean"),
+                "time": row.get("adaptation_tiempo_total_de_adaptacion_mean"),
+            }
+
+        if method.startswith("head_only_"):
+            percentage = method.removeprefix("head_only_")
+            return {
+                "label": f"FT_Head {percentage}",
+                "group": "ft_head",
+                "accuracy": row.get("adaptation_accuracy_global_mean"),
+                "time": row.get("adaptation_tiempo_total_de_adaptacion_mean"),
+            }
+
+        if method == "two_stage_finetuning":
+            return {
+                "label": "FT_Two_Phase 100%",
+                "group": "ft_two_phase",
+                "accuracy": row.get("adaptation_accuracy_global_mean"),
+                "time": row.get("adaptation_tiempo_total_de_adaptacion_mean"),
+            }
+
+        if method.startswith("two_stage_finetuning_"):
+            percentage = method.removeprefix("two_stage_finetuning_")
+            return {
+                "label": f"FT_Two_Phase {percentage}",
+                "group": "ft_two_phase",
+                "accuracy": row.get("adaptation_accuracy_global_mean"),
+                "time": row.get("adaptation_tiempo_total_de_adaptacion_mean"),
+            }
+
+        if method == "dynamic_precomputed_10%_early_stopping":
+            return {
+                "label": "FT_Select_Dist_Pre",
+                "group": "dynamic_pre",
+                "accuracy": row.get("adaptation_accuracy_global_mean"),
+                "time": row.get("adaptation_tiempo_total_de_adaptacion_mean"),
+            }
+
+        if method == "dynamic_epoch1_10%_early_stopping":
+            return {
+                "label": "FT_Select_Dist_Epoch1",
+                "group": "dynamic_epoch1",
+                "accuracy": row.get("adaptation_accuracy_global_mean"),
+                "time": row.get("adaptation_tiempo_total_de_adaptacion_mean"),
+            }
+
+        return None
+
     rows = []
     for row in fewshot_summaries:
         rows.append(
             {
-                "label": f"{row['shots_per_class']} shots",
-                "family": "fewshot",
+                "label": f"{row['shots_per_class']}-shot",
+                "group": "fewshot",
                 "accuracy": row.get("accuracy_global_mean"),
                 "time": row.get("tiempo_total_de_adaptacion_mean"),
             }
         )
     for row in comparison_summary_rows:
-        rows.append(
-            {
-                "label": row["comparison_method"],
-                "family": "adaptation",
-                "accuracy": row.get("adaptation_accuracy_global_mean"),
-                "time": row.get("adaptation_tiempo_total_de_adaptacion_mean"),
-            }
-        )
+        normalized_row = _normalize_plot_row(row)
+        if normalized_row is not None:
+            rows.append(normalized_row)
 
     rows = [row for row in rows if row["accuracy"] is not None and row["time"] is not None]
+    deduped_by_label = {}
+    for row in rows:
+        existing = deduped_by_label.get(row["label"])
+        if existing is None:
+            deduped_by_label[row["label"]] = row
+            continue
+        current_key = (float(row["accuracy"]), -float(row["time"]))
+        existing_key = (float(existing["accuracy"]), -float(existing["time"]))
+        if current_key > existing_key:
+            deduped_by_label[row["label"]] = row
+    rows = list(deduped_by_label.values())
     if not rows:
         return None
 
     fig, ax = plt.subplots(figsize=(11, 6.5))
-    colors = {"fewshot": "#4C956C", "adaptation": "#D17B0F"}
-    markers = {"fewshot": "o", "adaptation": "s"}
+    colors = {
+        "fewshot": "#1f77b4",
+        "baseline": "#8c564b",
+        "ft_head": "#ff7f0e",
+        "ft_two_phase": "#2ca02c",
+        "dynamic_pre": "#d62728",
+        "dynamic_epoch1": "#d62728",
+    }
+    markers = {
+        "fewshot": "o",
+        "baseline": "X",
+        "ft_head": "s",
+        "ft_two_phase": "^",
+        "dynamic_pre": "D",
+        "dynamic_epoch1": "D",
+    }
+    sizes = {
+        "fewshot": 160,
+        "baseline": 170,
+        "ft_head": 130,
+        "ft_two_phase": 130,
+        "dynamic_pre": 135,
+        "dynamic_epoch1": 135,
+    }
 
     for row in rows:
         ax.scatter(
             row["time"],
             row["accuracy"],
-            s=160 if row["family"] == "fewshot" else 120,
-            color=colors[row["family"]],
-            marker=markers[row["family"]],
+            s=sizes[row["group"]],
+            color=colors[row["group"]],
+            marker=markers[row["group"]],
             edgecolor="white",
             linewidth=0.8,
             alpha=0.95,
         )
+
+    placed_rows = sorted(rows, key=lambda item: (item["time"], item["accuracy"]))
+    label_positions = []
+    x_values = np.array([row["time"] for row in placed_rows], dtype=float)
+    y_values = np.array([row["accuracy"] for row in placed_rows], dtype=float)
+    x_span = max(float(np.max(x_values) - np.min(x_values)), 1e-9)
+    y_span = max(float(np.max(y_values) - np.min(y_values)), 1e-9)
+    x_threshold = max(x_span * 0.08, 1e-9)
+    y_threshold = max(y_span * 0.06, 1e-9)
+    offset_cycle = [
+        (6, 6),
+        (6, 18),
+        (6, -10),
+        (6, 30),
+        (6, -22),
+        (6, 42),
+        (6, -34),
+    ]
+
+    for row in placed_rows:
+        nearby_count = sum(
+            1
+            for other in label_positions
+            if abs(row["time"] - other["time"]) <= x_threshold
+            and abs(row["accuracy"] - other["accuracy"]) <= y_threshold
+        )
+        xytext = offset_cycle[min(nearby_count, len(offset_cycle) - 1)]
         ax.annotate(
             row["label"],
             (row["time"], row["accuracy"]),
             textcoords="offset points",
-            xytext=(6, 6),
+            xytext=xytext,
             fontsize=8,
+        )
+        label_positions.append(
+            {
+                "time": row["time"],
+                "accuracy": row["accuracy"],
+            }
         )
 
     ax.set_xscale("log")
@@ -583,8 +707,11 @@ def plot_accuracy_vs_time_landscape(output_dir: Path, fewshot_summaries: list, c
     ax.grid(True, alpha=0.25)
 
     legend_handles = [
-        plt.Line2D([0], [0], marker="o", color="w", label="Few-shot", markerfacecolor=colors["fewshot"], markersize=10),
-        plt.Line2D([0], [0], marker="s", color="w", label="Adaptation", markerfacecolor=colors["adaptation"], markersize=9),
+        plt.Line2D([0], [0], marker=markers["fewshot"], color="w", label="Few-shot", markerfacecolor=colors["fewshot"], markersize=10),
+        plt.Line2D([0], [0], marker=markers["baseline"], color="w", label="Baseline", markerfacecolor=colors["baseline"], markersize=10),
+        plt.Line2D([0], [0], marker=markers["ft_head"], color="w", label="FT_Head", markerfacecolor=colors["ft_head"], markersize=9),
+        plt.Line2D([0], [0], marker=markers["ft_two_phase"], color="w", label="FT_Two_Phase", markerfacecolor=colors["ft_two_phase"], markersize=9),
+        plt.Line2D([0], [0], marker=markers["dynamic_pre"], color="w", label="FT_Select_Dist", markerfacecolor=colors["dynamic_pre"], markersize=9),
     ]
     ax.legend(handles=legend_handles, loc="lower right")
 

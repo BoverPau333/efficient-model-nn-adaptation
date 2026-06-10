@@ -12,6 +12,9 @@ METHOD_SOURCES = {
     "baseline": "class_removal_baseline",
     "frozen_backbone_head": "class_removal_frozen_backbone_head",
     "finetuning": "class_removal_finetuning",
+    "prototypical_fewshot": "class_removal_prototypical_fewshot",
+    "dynamic_precomputed": "dynamic_embedding_finetuning/precompute_embeddings_then_finetune",
+    "dynamic_epoch1": "dynamic_embedding_finetuning/epoch1_embeddings_dynamic_finetune",
 }
 
 EXCLUDED_METHOD_VARIANTS = set()
@@ -44,6 +47,20 @@ def _method_variant(row: dict, source_name: str):
     if source_name == "baseline":
         return source_name
 
+    if source_name == "prototypical_fewshot":
+        shots = row.get("shots_per_class")
+        distance_metric = row.get("distance_metric", "cosine")
+        if shots in (None, "", "None"):
+            return f"fewshot_{distance_metric}"
+        return f"fewshot_{int(float(shots))}shot_{distance_metric}"
+
+    if source_name in {"dynamic_precomputed", "dynamic_epoch1"}:
+        train_percentage = row.get("train_percentage")
+        selection_strategy = row.get("selection_strategy", "unknown")
+        if train_percentage in (None, "", "None"):
+            return f"{source_name}_{selection_strategy}"
+        return f"{source_name}_{selection_strategy}_{float(train_percentage):g}%"
+
     train_percentage = row.get("train_percentage")
     training_mode = row.get("training_mode", source_name)
     if train_percentage in (None, "", "None"):
@@ -53,24 +70,35 @@ def _method_variant(row: dict, source_name: str):
 
 def normalize_summary_row(row: dict, source_name: str):
     """Lleva una fila de resumen a un esquema comun."""
-    accuracy_global = row.get("accuracy_global", row.get("test_overall_accuracy"))
-    accuracy_remaining = row.get("accuracy_en_clases_restantes", row.get("test_mean_per_class_accuracy"))
-    total_time = row.get("tiempo_total_de_adaptacion", row.get("elapsed_seconds"))
-    num_examples = row.get("numero_de_ejemplos_utilizados", row.get("num_examples_used_for_adaptation"))
+    accuracy_global = row.get("accuracy_global", row.get("test_overall_accuracy", row.get("accuracy")))
+    accuracy_remaining = row.get(
+        "accuracy_en_clases_restantes",
+        row.get("test_mean_per_class_accuracy", row.get("mean_per_class_accuracy")),
+    )
+    total_time = row.get("tiempo_total_de_adaptacion", row.get("elapsed_seconds", row.get("total_time")))
+    num_examples = row.get(
+        "numero_de_ejemplos_utilizados",
+        row.get("num_examples_used_for_adaptation", row.get("num_training_samples")),
+    )
     confidence = row.get("confianza_de_prediccion", row.get("prediction_confidence_mean"))
     trainable_params = row.get(
         "numero_de_parametros_entrenados_o_modificados",
         row.get("num_trainable_parameters"),
     )
+    forgetting_value = row.get("forgetting_u_olvido", row.get("forgetting_score"))
+    removed_class = row.get("removed_class", row.get("modified_class"))
+    train_percentage = row.get("train_percentage")
+    if source_name == "baseline" and train_percentage in (None, "", "None"):
+        train_percentage = 100.0
 
     normalized = {
         "source_name": source_name,
         "method_variant": _method_variant(row, source_name),
         "dataset": row.get("dataset"),
         "model_name": row.get("model_name"),
-        "removed_class": row.get("removed_class"),
+        "removed_class": removed_class,
         "status": row.get("status"),
-        "train_percentage": _safe_float(row.get("train_percentage")) if "train_percentage" in row else (100.0 if source_name == "baseline" else None),
+        "train_percentage": _safe_float(train_percentage),
         "training_mode": row.get("training_mode", source_name),
         "backbone_mode": row.get("backbone_mode"),
         "trainable_scope": row.get("trainable_scope"),
@@ -81,7 +109,7 @@ def normalize_summary_row(row: dict, source_name: str):
         "tiempo_total_de_adaptacion": _safe_float(total_time),
         "accuracy_global": _safe_float(accuracy_global),
         "accuracy_en_clases_restantes": _safe_float(accuracy_remaining),
-        "forgetting_u_olvido": _safe_float(row.get("forgetting_u_olvido")),
+        "forgetting_u_olvido": _safe_float(forgetting_value),
         "numero_de_ejemplos_utilizados": _safe_int(num_examples),
         "confianza_de_prediccion": _safe_float(confidence),
         "numero_de_parametros_entrenados_o_modificados": _safe_int(trainable_params),
@@ -175,21 +203,30 @@ def save_method_comparison_tables(output_dir: Path, all_rows: list, completed_ro
     write_csv(output_dir / "all_runs_normalized.csv", all_rows)
     write_csv(output_dir / "completed_runs_normalized.csv", completed_rows)
 
-    overall = aggregate_rows(completed_rows, ["source_name", "method_variant"])
     by_dataset = aggregate_rows(completed_rows, ["dataset", "source_name", "method_variant"])
+    overall_only = aggregate_rows(completed_rows, ["source_name", "method_variant"])
     by_model = aggregate_rows(completed_rows, ["model_name", "source_name", "method_variant"])
 
     by_dataset = add_relative_to_baseline(by_dataset, ["dataset", "source_name", "method_variant"])
+    overall = [{**row, "dataset": "ALL_DATASETS"} for row in overall_only]
+    combined_overall = sorted(
+        by_dataset + overall,
+        key=lambda row: (
+            str(row.get("dataset") or ""),
+            str(row.get("source_name") or ""),
+            str(row.get("method_variant") or ""),
+        ),
+    )
 
-    write_csv(output_dir / "method_summary_overall.csv", overall)
+    write_csv(output_dir / "method_summary_overall.csv", combined_overall)
     write_csv(output_dir / "method_summary_by_dataset.csv", by_dataset)
     write_csv(output_dir / "method_summary_by_model.csv", by_model)
-    save_json(output_dir / "method_summary_overall.json", overall)
+    save_json(output_dir / "method_summary_overall.json", combined_overall)
     save_json(output_dir / "method_summary_by_dataset.json", by_dataset)
     save_json(output_dir / "method_summary_by_model.json", by_model)
 
     return {
-        "overall": overall,
+        "overall": combined_overall,
         "by_dataset": by_dataset,
         "by_model": by_model,
     }

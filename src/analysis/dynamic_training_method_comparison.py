@@ -11,22 +11,22 @@ from src.core.results_utils import load_json, save_json, write_csv
 METHOD_SOURCES = {
     "frozen_backbone_head": {
         "folder": "class_removal_frozen_backbone_head",
-        "label": "Frozen head 10%",
+        "label": "FT_Head 10%",
         "glob": "**/final_metrics.json",
     },
     "finetuning": {
         "folder": "class_removal_finetuning",
-        "label": "Fine-tuning 10%",
+        "label": "FT_Two_Phase 10%",
         "glob": "**/final_metrics.json",
     },
     "dynamic_precomputed": {
         "folder": "dynamic_embedding_finetuning/precompute_embeddings_then_finetune",
-        "label": "Dynamic precomputed 10%",
+        "label": "FT_Select_Dist_Pre",
         "glob": "**/final_metrics.json",
     },
     "dynamic_epoch1": {
         "folder": "dynamic_embedding_finetuning/epoch1_embeddings_dynamic_finetune",
-        "label": "Dynamic epoch1 10%",
+        "label": "FT_Select_Dist_Epoch1",
         "glob": "**/final_metrics.json",
     },
 }
@@ -41,12 +41,12 @@ METHOD_ORDER = [
 ]
 
 METHOD_COLORS = {
-    "frozen_backbone_head": "#4C78A8",
-    "finetuning": "#F58518",
-    "dynamic_precomputed": "#54A24B",
-    "dynamic_epoch1": "#E45756",
-    "dynamic_precomputed_early_stopping": "#72B7B2",
-    "dynamic_epoch1_early_stopping": "#B279A2",
+    "frozen_backbone_head": "#f28e2b",
+    "finetuning": "#59a14f",
+    "dynamic_precomputed": "#d62728",
+    "dynamic_epoch1": "#4C78A8",
+    "dynamic_precomputed_early_stopping": "#d62728",
+    "dynamic_epoch1_early_stopping": "#4C78A8",
 }
 
 METRICS = [
@@ -83,8 +83,7 @@ def build_method_sources(dynamic_variant: str | None = None):
             variant_source_name = f"{source_name}_early_stopping"
             variant_source = METHOD_SOURCES[source_name].copy()
             variant_source["folder"] = f"{variant_source['folder']}/early_stopping"
-            base_label = variant_source["label"].replace(" 10%", "")
-            variant_source["label"] = f"{base_label} (early stopping) 10%"
+            variant_source["label"] = f"{variant_source['label']} (ES)"
             sources[variant_source_name] = variant_source
         return sources
 
@@ -94,8 +93,6 @@ def build_method_sources(dynamic_variant: str | None = None):
     if dynamic_variant:
         for source_name in dynamic_base_keys:
             sources[source_name]["folder"] = f"{sources[source_name]['folder']}/{dynamic_variant}"
-            base_label = sources[source_name]["label"].replace(" 10%", "")
-            sources[source_name]["label"] = f"{base_label} ({dynamic_variant.replace('_', ' ')}) 10%"
     return sources
 
 
@@ -220,6 +217,11 @@ def plot_overall_comparison(output_dir: Path, overall_rows: list):
     plots_dir = output_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
     save_path = plots_dir / "dynamic_vs_training_methods_overall.png"
+
+    overall_rows = [
+        row for row in overall_rows
+        if row.get("source_name") != "dynamic_epoch1"
+    ]
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     axes = axes.flatten()

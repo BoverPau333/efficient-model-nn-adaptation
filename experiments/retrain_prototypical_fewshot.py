@@ -7,19 +7,29 @@ import traceback
 from pathlib import Path
 
 import numpy as np
+import torch
 from torch.utils.data import Subset
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from src.adaptation.class_addition_experiment_utils import (
+    build_addition_summary_row,
+    compute_previous_class_forgetting,
+    f1_from_confusion_matrix,
+    get_classes_to_add,
+    load_addition_reference_artifacts,
+    precision_from_confusion_matrix,
+)
 from src.adaptation.class_removal_experiment_utils import get_classes_to_remove
 from src.dataset.loaders import DATASET_LOADERS
-from src.dataset.utils import count_examples_per_class, remove_class_and_remap
+from src.dataset.utils import count_examples_per_class, remove_class_and_remap, resolve_class_to_remove
 from src.core.embedding_utils import IndexedDataset, extract_embeddings
 from src.adaptation.episode_sampler import sample_k_shot_support_set
 from src.experiments_config.class_removal_baseline_config import DEFAULT_DATASET
 from src.experiments_config.config import BATCH_SIZE, NUM_WORKERS, RESULTS_DIR, SEED
+from src.metrics_addition import METRICAS_ADICION
 from src.metrics_elimination import METRICAS_ELIMINACION
 from src.models import IMAGENET_MODEL_BUILDERS
 from src.adaptation.prototypical_utils import (
@@ -28,6 +38,7 @@ from src.adaptation.prototypical_utils import (
     serialize_prototypes,
 )
 from src.core.results_utils import (
+    add_output_class,
     build_loader,
     compute_forgetting_from_reference,
     load_json,
@@ -41,7 +52,9 @@ from src.core.results_utils import (
 
 
 DEFAULT_REFERENCE_OUTPUT_DIR = RESULTS_DIR / "full_training_reference_imagenet"
+DEFAULT_ADDITION_REFERENCE_OUTPUT_DIR = RESULTS_DIR / "full_training_reference_add"
 DEFAULT_OUTPUT_DIR = RESULTS_DIR / "class_removal_prototypical_fewshot"
+DEFAULT_ADDITION_OUTPUT_DIR = RESULTS_DIR / "class_addition_prototypical_fewshot"
 
 
 def parse_args():
@@ -80,7 +93,7 @@ def parse_args():
         "--update-type",
         choices=["remove", "add"],
         default="remove",
-        help="Class-set modification to evaluate. 'add' is scaffolded but not yet supported by local datasets.",
+        help="Class-set modification to evaluate.",
     )
     parser.add_argument(
         "--shots-per-class",
@@ -128,6 +141,22 @@ def parse_args():
         help="Re-run experiments even if final metrics already exist.",
     )
     return parser.parse_args()
+
+
+def resolve_reference_dir(args) -> Path:
+    """Usa la referencia adecuada segun remove/add."""
+    configured = Path(args.reference_dir)
+    if args.update_type == "add" and configured == DEFAULT_REFERENCE_OUTPUT_DIR:
+        return DEFAULT_ADDITION_REFERENCE_OUTPUT_DIR
+    return configured
+
+
+def resolve_output_dir(args) -> Path:
+    """Usa una carpeta de resultados distinta para add si se dejo el default de remove."""
+    configured = Path(args.output_dir)
+    if args.update_type == "add" and configured == DEFAULT_OUTPUT_DIR:
+        return DEFAULT_ADDITION_OUTPUT_DIR
+    return configured
 
 
 def build_experiment_dir(dataset_output_dir: Path, model_name: str, modified_class_name, shots_per_class: int, update_type: str):
@@ -187,6 +216,8 @@ def build_summary_row(
         "update_type": update_type,
         "status": status,
     }
+    if update_type == "add":
+        row["added_class"] = str(modified_class_name)
 
     if metrics_payload is not None:
         row.update(
@@ -210,6 +241,8 @@ def build_summary_row(
                 "method": metrics_payload["method"],
             }
         )
+        if metrics_payload.get("update_type") == "add":
+            row["added_class"] = str(metrics_payload.get("added_class", modified_class_name))
 
     if error_message is not None:
         row["error"] = error_message
@@ -267,11 +300,43 @@ def prepare_modified_datasets(dataset_name: str, train_ds, val_ds, test_ds, orig
             "modified_class_idx_original": int(metadata["removed_class_idx"]),
         }
 
-    parsed_class = parse_class_identifier(class_identifier)
-    raise NotImplementedError(
-        f"update_type='add' todavia no esta soportado para '{dataset_name}'. "
-        f"El codigo queda preparado, pero falta definir la fuente de datos para la nueva clase '{parsed_class}'."
+    added_class_idx, added_class_name = resolve_class_to_remove(original_classes, class_identifier)
+    return {
+        "train": train_ds,
+        "val": val_ds,
+        "test": test_ds,
+        "classes": list(original_classes),
+        "modified_class_name": added_class_name,
+        "modified_class_idx_original": int(added_class_idx),
+    }
+
+
+def load_fewshot_reference_model(dataset_name: str, model_name: str, modified_setup: dict, args):
+    """Carga la referencia correcta para remove/add."""
+    if args.update_type == "remove":
+        active_classes = modified_setup["classes"]
+        original_num_classes = len(active_classes) + 1
+        return load_reference_model(
+            reference_dir=resolve_reference_dir(args),
+            dataset_name=dataset_name,
+            model_name=model_name,
+            num_classes=original_num_classes,
+        )
+
+    reference_metrics, reference_metrics_path, checkpoint_path = load_addition_reference_artifacts(
+        reference_dir=resolve_reference_dir(args),
+        dataset_name=dataset_name,
+        model_name=model_name,
+        added_class_name=modified_setup["modified_class_name"],
     )
+    model = IMAGENET_MODEL_BUILDERS[model_name](len(modified_setup["classes"]) - 1)
+    state = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = state["model_state_dict"] if "model_state_dict" in state else state
+    model.load_state_dict(state_dict)
+    add_output_class(model, modified_setup["modified_class_idx_original"])
+    from src.experiments_config.config import DEVICE
+    model.to(DEVICE)
+    return model, reference_metrics, checkpoint_path, reference_metrics_path
 
 
 def run_single_experiment(
@@ -309,12 +374,11 @@ def run_single_experiment(
     set_seed(args.seed)
     total_start = time.time()
 
-    original_num_classes = len(active_classes) + (1 if args.update_type == "remove" else 0)
-    model, reference_metrics, checkpoint_path, reference_metrics_path = load_reference_model(
-        reference_dir=Path(args.reference_dir),
+    model, reference_metrics, checkpoint_path, reference_metrics_path = load_fewshot_reference_model(
         dataset_name=dataset_name,
         model_name=model_name,
-        num_classes=original_num_classes,
+        modified_setup=modified_setup,
+        args=args,
     )
 
     support_selection = sample_k_shot_support_set(
@@ -390,10 +454,6 @@ def run_single_experiment(
     evaluation_time = time.time() - evaluation_start
 
     split_counts = aggregate_counts(active_train, active_val, active_test, active_classes)
-    forgetting_value = compute_forgetting_from_reference(
-        reference_per_class_accuracy=reference_metrics.get("test_per_class_accuracy"),
-        current_per_class_accuracy=test_metrics["per_class_accuracy"],
-    )
 
     prototype_rows = serialize_prototypes(prototypes_by_class, active_classes)
     prototype_memory = sum(
@@ -401,17 +461,14 @@ def run_single_experiment(
         for class_idx in prototypes_by_class
     )
     elapsed = time.time() - total_start
-
-    metrics_payload = {
+    common_payload = {
         "dataset": dataset_name,
         "model_name": model_name,
         "method": "prototypical_fewshot",
         "embedding_strategy": "reference_backbone_embeddings",
-        "initialization": "imagenet",
         "backbone_mode": "frozen",
         "trainable_scope": "prototype_only",
         "update_type": args.update_type,
-        "removed_class": str(modified_class_name) if args.update_type == "remove" else "__none__",
         "modified_class": str(modified_class_name),
         "modified_class_idx_original": modified_setup.get("modified_class_idx_original"),
         "final_num_classes": int(len(active_classes)),
@@ -435,27 +492,96 @@ def run_single_experiment(
         "class_names": list(active_classes),
         "examples_per_split": split_counts,
         "num_examples_used_for_adaptation": int(len(support_selection.indices)),
-        "support_examples_per_class": {active_classes[int(k)]: len(v) for k, v in support_selection.indices_by_class.items()},
+        "support_examples_per_class": {
+            active_classes[int(k)]: len(v) for k, v in support_selection.indices_by_class.items()
+        },
         "prediction_confidence_mean": float(test_metrics["prediction_confidence_mean"]),
         "num_trainable_parameters": 0,
         "additional_memory_required": float(prototype_memory),
-        "forgetting_u_olvido": None if forgetting_value is None else float(forgetting_value),
-        "forgetting_reference_source": "full_training_reference_imagenet",
-        "forgetting_reference_metrics_path": str(reference_metrics_path),
         "reference_checkpoint_path": str(checkpoint_path),
-        "metricas_eliminacion": [metrica.nombre for metrica in METRICAS_ELIMINACION],
         "stores_model_checkpoint": False,
         "prototype_embedding_dim": int(np.asarray(next(iter(prototypes_by_class.values()))).shape[0]),
     }
-    metrics_payload["summary"] = build_summary_row(
-        dataset_name=dataset_name,
-        model_name=model_name,
-        modified_class_name=modified_class_name,
-        final_num_classes=len(active_classes),
-        update_type=args.update_type,
-        status="completed",
-        metrics_payload=metrics_payload,
-    )
+
+    if args.update_type == "remove":
+        forgetting_value = compute_forgetting_from_reference(
+            reference_per_class_accuracy=reference_metrics.get("test_per_class_accuracy"),
+            current_per_class_accuracy=test_metrics["per_class_accuracy"],
+        )
+        metrics_payload = {
+            **common_payload,
+            "initialization": "imagenet",
+            "removed_class": str(modified_class_name),
+            "forgetting_u_olvido": None if forgetting_value is None else float(forgetting_value),
+            "forgetting_reference_source": "full_training_reference_imagenet",
+            "forgetting_reference_metrics_path": str(reference_metrics_path),
+            "metricas_eliminacion": [metrica.nombre for metrica in METRICAS_ELIMINACION],
+        }
+        metrics_payload["summary"] = build_summary_row(
+            dataset_name=dataset_name,
+            model_name=model_name,
+            modified_class_name=modified_class_name,
+            final_num_classes=len(active_classes),
+            update_type=args.update_type,
+            status="completed",
+            metrics_payload=metrics_payload,
+        )
+    else:
+        added_class_name = modified_class_name
+        previous_class_accuracies = [
+            float(accuracy)
+            for class_name, accuracy in test_metrics["per_class_accuracy"].items()
+            if str(class_name) != str(added_class_name)
+        ]
+        forgetting_previous_classes = compute_previous_class_forgetting(
+            reference_per_class_accuracy=reference_metrics.get("test_per_class_accuracy", {}),
+            current_per_class_accuracy=test_metrics["per_class_accuracy"],
+            added_class_name=added_class_name,
+        )
+        confusion_matrix = np.asarray(test_metrics["confusion_matrix"])
+        added_class_idx = int(modified_setup["modified_class_idx_original"])
+        metrics_payload = {
+            **common_payload,
+            "initialization": "reference_without_added_class",
+            "added_class": str(added_class_name),
+            "test_accuracy_previous_classes": (
+                float(np.mean(previous_class_accuracies)) if previous_class_accuracies else 0.0
+            ),
+            "test_accuracy_added_class": float(test_metrics["per_class_accuracy"][str(added_class_name)]),
+            "test_precision_added_class": precision_from_confusion_matrix(confusion_matrix, added_class_idx),
+            "test_recall_added_class": float(test_metrics["per_class_accuracy"][str(added_class_name)]),
+            "test_f1_added_class": f1_from_confusion_matrix(confusion_matrix, added_class_idx),
+            "prediction_confidence_added_class_mean": float(
+                np.mean(
+                    [
+                        max(probabilities)
+                        for label, probabilities in zip(
+                            test_metrics["labels"],
+                            test_metrics["probabilities"],
+                        )
+                        if int(label) == added_class_idx
+                    ]
+                )
+            ) if any(int(label) == added_class_idx for label in test_metrics["labels"]) else 0.0,
+            "num_examples_added_class_train": int(
+                len(support_selection.indices_by_class[str(added_class_idx)])
+            ),
+            "forgetting_previous_classes": (
+                None if forgetting_previous_classes is None else float(forgetting_previous_classes)
+            ),
+            "reference_9_class_source": "full_training_reference_add",
+            "reference_9_class_metrics_path": str(reference_metrics_path),
+            "reference_9_class_checkpoint_path": str(checkpoint_path),
+            "metricas_adicion": [metrica.nombre for metrica in METRICAS_ADICION],
+        }
+        metrics_payload["summary"] = build_addition_summary_row(
+            dataset_name=dataset_name,
+            model_name=model_name,
+            added_class_name=added_class_name,
+            final_num_classes=len(active_classes),
+            status="completed",
+            metrics_payload=metrics_payload,
+        )
 
     save_experiment_artifacts(
         experiment_dir=experiment_dir,
@@ -472,7 +598,7 @@ def run_single_experiment(
             "batch_size": int(args.batch_size),
             "num_workers": int(args.num_workers),
             "seed": int(args.seed),
-            "reference_dir": str(args.reference_dir),
+            "reference_dir": str(resolve_reference_dir(args)),
         },
         prototype_rows=prototype_rows,
         support_payload={
@@ -498,7 +624,7 @@ def run_all_experiments(args):
     dataset_names = sorted(DATASET_LOADERS) if args.all_datasets else [args.dataset]
     selected_models = list(args.models)
     all_summary_rows = []
-    base_output_dir = Path(args.output_dir)
+    base_output_dir = resolve_output_dir(args)
     base_output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Datasets selected: {dataset_names}")
@@ -515,8 +641,10 @@ def run_all_experiments(args):
 
         try:
             train_ds, val_ds, test_ds, original_classes = DATASET_LOADERS[dataset_name]()
-            class_identifiers = get_classes_to_remove(dataset_name, args.classes) if args.update_type == "remove" else (
-                [parse_class_identifier(value) for value in args.classes] if args.classes else []
+            class_identifiers = (
+                get_classes_to_remove(dataset_name, args.classes)
+                if args.update_type == "remove"
+                else get_classes_to_add(dataset_name, args.classes)
             )
             if not class_identifiers:
                 raise ValueError("No classes provided for the requested update_type.")
@@ -555,7 +683,11 @@ def run_all_experiments(args):
                             dataset_name=dataset_name,
                             model_name=model_name,
                             modified_class_name=class_identifier,
-                            final_num_classes=max(len(original_classes) - 1, 0),
+                            final_num_classes=(
+                                max(len(original_classes) - 1, 0)
+                                if args.update_type == "remove"
+                                else len(original_classes)
+                            ),
                             update_type=args.update_type,
                             status="failed",
                             error_message=error_message,

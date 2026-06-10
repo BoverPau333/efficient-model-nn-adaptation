@@ -23,6 +23,7 @@ from src.adaptation.dynamic_finetuning_utils import (
     build_dynamic_arg_parser,
     build_experiment_dir,
     finalize_dynamic_experiment,
+    load_dynamic_reference_model,
     load_existing_dynamic_summary,
     parse_class_identifier,
     prepare_update_datasets,
@@ -34,7 +35,6 @@ from src.core.results_utils import (
     build_loader,
     evaluate_classification_metrics,
     freeze_backbone_keep_head_trainable,
-    load_reference_model,
     remove_output_class,
     set_seed,
 )
@@ -107,11 +107,12 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
     set_seed(args.seed)
     total_start = perf_counter()
     log_progress(dataset_name, model_name, args.modified_class, "loading reference model")
-    model, reference_metrics, checkpoint_path, reference_metrics_path = load_reference_model(
-        reference_dir=Path(args.reference_dir),
+    model, reference_metrics, checkpoint_path, reference_metrics_path = load_dynamic_reference_model(
         dataset_name=dataset_name,
         model_name=model_name,
-        num_classes=len(classes),
+        args=args,
+        setup=setup,
+        classes=classes,
     )
     log_progress(
         dataset_name,
@@ -133,9 +134,10 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         ]
         student_class_indices = list(range(len(setup["active_classes"])))
     else:
-        common_num_classes = min(len(classes), len(setup["active_classes"]))
-        teacher_class_indices = list(range(common_num_classes))
-        student_class_indices = list(range(common_num_classes))
+        teacher_class_indices = [
+            idx for idx in range(len(classes)) if idx != int(setup["modified_class_idx_original"])
+        ]
+        student_class_indices = list(teacher_class_indices)
     freeze_backbone_keep_head_trainable(model)
     log_progress(dataset_name, model_name, args.modified_class, "backbone frozen, head ready for fine-tuning")
 
@@ -196,6 +198,7 @@ def run_single_experiment(dataset_name: str, model_name: str, args, base_output_
         target_percentage=args.porc,
         train_dataset_size=len(setup["train_active"]),
         modified_class_weight=args.samples_per_modified_class,
+        modified_class_fraction=args.modified_class_fraction,
         neighbour_class_weight=args.samples_per_neighbour_class,
         far_class_weight=args.memory_samples_per_far_class,
         selection_strategy=args.selection_strategy,
