@@ -257,6 +257,13 @@ def _load_summary_rows(results_root: Path, folder_name: str, source_name: str):
         return []
 
     rows = []
+    aggregated_summary_path = method_dir / "all_experiments_summary.json"
+    if aggregated_summary_path.exists():
+        payload = load_json(aggregated_summary_path)
+        for row in payload:
+            rows.append(normalize_summary_row(row, source_name))
+        return rows
+
     for summary_path in sorted(method_dir.glob("*/experiments_summary.json")):
         payload = load_json(summary_path)
         for row in payload:

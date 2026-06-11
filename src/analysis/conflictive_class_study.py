@@ -14,6 +14,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib import ticker
 
 from src.core.results_utils import save_json, write_csv
 
@@ -44,6 +45,10 @@ CONFLICT_GROUP_LABELS = {
 CONFLICT_GROUP_COLORS = {
     "conflictiva": "#BC4749",
     "poco_conflictiva": "#4C956C",
+}
+CONFLICT_GROUP_HATCHES = {
+    "conflictiva": "///",
+    "poco_conflictiva": "",
 }
 
 ADDITION_METRICS = [
@@ -319,6 +324,50 @@ def _resolve_subplot_grid(metric_specs: list[tuple[str, str, str]]):
     return nrows, ncols
 
 
+def _format_metric_value(metric_name: str, value: float):
+    if metric_name.startswith("accuracy_") or "forgetting" in metric_name:
+        return f"{value * 100:.1f}%"
+    if "tiempo_total" in metric_name:
+        return f"{value:.0f}s"
+    return f"{value:.2f}"
+
+
+def _style_metric_axis(ax, metric_name: str, ylabel: str):
+    ax.set_facecolor("#FBFBF8")
+    ax.grid(axis="y", color="#D8D8D8", linewidth=0.8, alpha=0.6)
+    ax.set_axisbelow(True)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_color("#9A9A9A")
+    ax.spines["bottom"].set_color("#9A9A9A")
+    if metric_name.startswith("accuracy_") or "forgetting" in metric_name:
+        ax.yaxis.set_major_formatter(ticker.PercentFormatter(xmax=1.0, decimals=0))
+    elif "tiempo_total" in metric_name:
+        ax.yaxis.set_major_formatter(ticker.StrMethodFormatter("{x:,.0f}"))
+    ax.set_ylabel(ylabel, fontsize=10, color="#333333")
+
+
+def _annotate_bars(ax, xs, means: list[float | None], metric_name: str):
+    valid_values = [value for value in means if value is not None]
+    if not valid_values:
+        return
+    ylim = ax.get_ylim()
+    offset = (ylim[1] - ylim[0]) * 0.02
+    for x_coord, value in zip(xs, means):
+        if value is None:
+            continue
+        ax.text(
+            x_coord,
+            value + offset,
+            _format_metric_value(metric_name, value),
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            color="#303030",
+            rotation=90 if "tiempo_total" in metric_name else 0,
+        )
+
+
 def _plot_method_dataset_comparison(
     *,
     task_name: str,
@@ -343,7 +392,8 @@ def _plot_method_dataset_comparison(
 
     n_metrics = len(metric_specs)
     nrows, ncols = _resolve_subplot_grid(metric_specs)
-    fig, axes = plt.subplots(nrows, ncols, figsize=(6.5 * ncols, 4.6 * nrows))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(7.2 * ncols, 5.1 * nrows))
+    fig.patch.set_facecolor("#F4F1EA")
     axes = np.atleast_1d(axes).flatten()
 
     x = np.arange(len(ordered_variants), dtype=float)
@@ -373,16 +423,28 @@ def _plot_method_dataset_comparison(
                 yerr=stds,
                 capsize=4,
                 color=CONFLICT_GROUP_COLORS[group_name],
-                edgecolor="white",
+                edgecolor="#FFFFFF",
+                linewidth=1.0,
+                hatch=CONFLICT_GROUP_HATCHES[group_name],
                 label=CONFLICT_GROUP_LABELS[group_name],
+                alpha=0.92,
             )
 
         ax.set_title(title, fontsize=11, fontweight="bold")
-        ax.set_ylabel(ylabel, fontsize=10)
         ax.set_xticks(x)
-        ax.set_xticklabels(method_labels, rotation=20, ha="right", fontsize=9)
-        ax.grid(axis="y", alpha=0.25)
+        ax.set_xticklabels(method_labels, rotation=16, ha="right", fontsize=9)
         _set_informative_ylim(ax, metric_name, all_means, all_stds)
+        _style_metric_axis(ax, metric_name, ylabel)
+        for idx, group_name in enumerate(CONFLICT_GROUP_ORDER):
+            offset = (-width / 2.0) if idx == 0 else (width / 2.0)
+            means = []
+            for variant in ordered_variants:
+                match = next(
+                    (row for row in grouped_by_variant[variant] if row["conflict_group"] == group_name),
+                    None,
+                )
+                means.append(None if match is None or match.get(f"{metric_name}_mean") is None else match[f"{metric_name}_mean"])
+            _annotate_bars(ax, x + offset, means, metric_name)
 
     for ax in axes[n_metrics:]:
         ax.axis("off")
@@ -392,7 +454,7 @@ def _plot_method_dataset_comparison(
         handles,
         labels,
         loc="upper center",
-        bbox_to_anchor=(0.5, 0.955),
+        bbox_to_anchor=(0.5, 0.965),
         ncol=2,
         frameon=False,
     )
@@ -402,12 +464,12 @@ def _plot_method_dataset_comparison(
         fontweight="bold",
         y=0.992,
     )
-    plt.tight_layout(rect=(0, 0, 1, 0.90))
+    plt.tight_layout(rect=(0.02, 0.02, 0.98, 0.90))
 
     save_dir = output_dir / "plots" / task_name / dataset_name
     save_dir.mkdir(parents=True, exist_ok=True)
     save_path = save_dir / f"{source_name}_conflictive_vs_non_conflictive.png"
-    plt.savefig(save_path, dpi=180)
+    plt.savefig(save_path, dpi=220, facecolor=fig.get_facecolor(), bbox_inches="tight")
     plt.close(fig)
     return save_path
 
@@ -437,7 +499,8 @@ def _plot_operation_overall_comparison(
 
     n_metrics = len(metric_specs)
     nrows, ncols = _resolve_subplot_grid(metric_specs)
-    fig, axes = plt.subplots(nrows, ncols, figsize=(6.8 * ncols, 4.8 * nrows))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(7.4 * ncols, 5.2 * nrows))
+    fig.patch.set_facecolor("#F4F1EA")
     axes = np.atleast_1d(axes).flatten()
 
     x = np.arange(len(ordered_variants), dtype=float)
@@ -473,29 +536,41 @@ def _plot_operation_overall_comparison(
                 yerr=stds,
                 capsize=4,
                 color=CONFLICT_GROUP_COLORS[group_name],
-                edgecolor="white",
+                edgecolor="#FFFFFF",
+                linewidth=1.0,
+                hatch=CONFLICT_GROUP_HATCHES[group_name],
                 label=CONFLICT_GROUP_LABELS[group_name],
+                alpha=0.92,
             )
 
         ax.set_title(title, fontsize=11, fontweight="bold")
-        ax.set_ylabel(ylabel, fontsize=10)
         ax.set_xticks(x)
-        ax.set_xticklabels(method_labels, rotation=25, ha="right", fontsize=9)
-        ax.grid(axis="y", alpha=0.25)
+        ax.set_xticklabels(method_labels, rotation=18, ha="right", fontsize=9)
         _set_informative_ylim(ax, metric_name, all_means, all_stds)
+        _style_metric_axis(ax, metric_name, ylabel)
+        for idx, group_name in enumerate(CONFLICT_GROUP_ORDER):
+            offset = (-width / 2.0) if idx == 0 else (width / 2.0)
+            means = []
+            for variant in ordered_variants:
+                match = next(
+                    (row for row in grouped_by_variant[variant] if row["conflict_group"] == group_name),
+                    None,
+                )
+                means.append(None if match is None or match.get(f"{metric_name}_mean") is None else match[f"{metric_name}_mean"])
+            _annotate_bars(ax, x + offset, means, metric_name)
 
     for ax in axes[n_metrics:]:
         ax.axis("off")
 
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.955), ncol=2, frameon=False)
+    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.965), ncol=2, frameon=False)
     fig.suptitle(f"{title_prefix} | {task_name}", fontsize=14, fontweight="bold", y=0.992)
-    plt.tight_layout(rect=(0, 0, 1, 0.90))
+    plt.tight_layout(rect=(0.02, 0.02, 0.98, 0.90))
 
     save_dir = output_dir / "plots" / task_name / save_dirname
     save_dir.mkdir(parents=True, exist_ok=True)
     save_path = save_dir / save_filename
-    plt.savefig(save_path, dpi=180)
+    plt.savefig(save_path, dpi=220, facecolor=fig.get_facecolor(), bbox_inches="tight")
     plt.close(fig)
     return save_path
 
