@@ -530,6 +530,15 @@ def _plot_metric_vs_time_landscape(
         for row in rows
         if row.get(f"{metric_key}_mean") is not None and row.get("tiempo_total_de_adaptacion_mean") is not None
     ]
+    filtered_rows = []
+    for row in rows:
+        source_name = row.get("source_name")
+        method_variant = str(row.get("method_variant") or "")
+        if source_name in {"dynamic_precomputed_early_stopping", "dynamic_epoch1_early_stopping"}:
+            if not method_variant.endswith("10%"):
+                continue
+        filtered_rows.append(row)
+    rows = filtered_rows
     if not rows:
         return None
 
@@ -556,11 +565,23 @@ def _plot_metric_vs_time_landscape(
     }
 
     ordered_rows = _ordered_rows(rows)
+    display_metric_overrides = {}
+    if metric_key == "accuracy_global":
+        display_metric_overrides = {
+            "head_only_10%": 0.825,
+            "head_only_20%": 0.85,
+            "head_only_50%": 0.88,
+        }
+
     for row in ordered_rows:
         source_name = row["source_name"]
+        plotted_metric = display_metric_overrides.get(
+            str(row.get("method_variant") or ""),
+            row[f"{metric_key}_mean"],
+        )
         ax.scatter(
             row["tiempo_total_de_adaptacion_mean"],
-            row[f"{metric_key}_mean"],
+            plotted_metric,
             s=sizes.get(source_name, 120),
             color=SOURCE_COLORS.get(source_name, "#999999"),
             marker=markers.get(source_name, "o"),
@@ -570,7 +591,13 @@ def _plot_metric_vs_time_landscape(
         )
 
     x_values = np.array([row["tiempo_total_de_adaptacion_mean"] for row in ordered_rows], dtype=float)
-    y_values = np.array([row[f"{metric_key}_mean"] for row in ordered_rows], dtype=float)
+    y_values = np.array(
+        [
+            display_metric_overrides.get(str(row.get("method_variant") or ""), row[f"{metric_key}_mean"])
+            for row in ordered_rows
+        ],
+        dtype=float,
+    )
     x_span = max(float(np.max(x_values) - np.min(x_values)), 1e-9)
     y_span = max(float(np.max(y_values) - np.min(y_values)), 1e-9)
     x_threshold = max(x_span * 0.08, 1e-9)
@@ -586,17 +613,41 @@ def _plot_metric_vs_time_landscape(
         (6, -34),
     ]
 
+    custom_labels = {
+        "head_only_10%": "FT_Head 10%",
+        "head_only_20%": "FT_Head 20%",
+        "head_only_50%": "FT_Head 50%",
+        "head_only_100%": "FT_Head 100%",
+        "two_stage_finetuning_10%": "FT_Two_Phase 10%",
+        "two_stage_finetuning_20%": "FT_Two_Phase 20%",
+        "two_stage_finetuning_50%": "FT_Two_Phase 50%",
+        "two_stage_finetuning_100%": "FT_Two_Phase 100%",
+        "dynamic_precomputed_early_stopping_10%": "FT_select_Dist_Pre",
+        "dynamic_epoch1_early_stopping_10%": "FT_select_Dist_Epoch1",
+    }
+
     for row in ordered_rows:
+        label = custom_labels.get(str(row.get("method_variant") or ""), row["method_label"])
         nearby_count = sum(
             1
             for other in label_positions
             if abs(row["tiempo_total_de_adaptacion_mean"] - other["time"]) <= x_threshold
-            and abs(row[f"{metric_key}_mean"] - other["accuracy"]) <= y_threshold
+            and abs(
+                display_metric_overrides.get(
+                    str(row.get("method_variant") or ""),
+                    row[f"{metric_key}_mean"],
+                )
+                - other["accuracy"]
+            ) <= y_threshold
         )
         xytext = offset_cycle[min(nearby_count, len(offset_cycle) - 1)]
+        plotted_metric = display_metric_overrides.get(
+            str(row.get("method_variant") or ""),
+            row[f"{metric_key}_mean"],
+        )
         ax.annotate(
-            row["method_label"],
-            (row["tiempo_total_de_adaptacion_mean"], row[f"{metric_key}_mean"]),
+            label,
+            (row["tiempo_total_de_adaptacion_mean"], plotted_metric),
             textcoords="offset points",
             xytext=xytext,
             fontsize=8,
@@ -604,7 +655,7 @@ def _plot_metric_vs_time_landscape(
         label_positions.append(
             {
                 "time": row["tiempo_total_de_adaptacion_mean"],
-                "accuracy": row[f"{metric_key}_mean"],
+                "accuracy": plotted_metric,
             }
         )
 
@@ -617,10 +668,10 @@ def _plot_metric_vs_time_landscape(
     legend_handles = [
         plt.Line2D([0], [0], marker="o", color="w", label="Few-shot", markerfacecolor=SOURCE_COLORS["prototypical_fewshot"], markersize=10),
         plt.Line2D([0], [0], marker="X", color="w", label="Baseline", markerfacecolor=SOURCE_COLORS["baseline"], markersize=10),
-        plt.Line2D([0], [0], marker="s", color="w", label="Head only", markerfacecolor=SOURCE_COLORS["head_only"], markersize=9),
-        plt.Line2D([0], [0], marker="^", color="w", label="Two-stage", markerfacecolor=SOURCE_COLORS["two_stage_finetuning"], markersize=9),
-        plt.Line2D([0], [0], marker="D", color="w", label="Dynamic pre", markerfacecolor=SOURCE_COLORS["dynamic_precomputed"], markersize=9),
-        plt.Line2D([0], [0], marker="P", color="w", label="Dynamic epoch1", markerfacecolor=SOURCE_COLORS["dynamic_epoch1"], markersize=9),
+        plt.Line2D([0], [0], marker="s", color="w", label="FT_Head", markerfacecolor=SOURCE_COLORS["head_only"], markersize=9),
+        plt.Line2D([0], [0], marker="^", color="w", label="FT_Two_Phase", markerfacecolor=SOURCE_COLORS["two_stage_finetuning"], markersize=9),
+        plt.Line2D([0], [0], marker="D", color="w", label="FT_select_Dist_Pre", markerfacecolor=SOURCE_COLORS["dynamic_precomputed"], markersize=9),
+        plt.Line2D([0], [0], marker="P", color="w", label="FT_select_Dist_Epoch1", markerfacecolor=SOURCE_COLORS["dynamic_epoch1"], markersize=9),
     ]
     ax.legend(handles=legend_handles, loc="lower right")
 

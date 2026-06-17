@@ -1,4 +1,4 @@
-"""Train full-class reference models from ImageNet weights for forgetness comparisons."""
+"""Entrena referencias completas con pesos ImageNet para comparar forgetting."""
 
 import argparse
 import time
@@ -9,9 +9,13 @@ import numpy as np
 import torch
 
 from src.adaptation.class_removal_experiment_utils import total_examples_from_split_counts
+from src.core.experiment_utils import (
+    aggregate_split_counts,
+    load_summary_from_metrics,
+    save_experiment_artifacts,
+)
 from src.experiments_config.config import BATCH_SIZE, EPOCHS, LR, NUM_WORKERS, RESULTS_DIR, SEED
 from src.dataset.loaders import DATASET_LOADERS
-from src.dataset.utils import count_examples_per_class
 from src.metrics_elimination import METRICAS_ELIMINACION
 from src.models import IMAGENET_MODEL_BUILDERS
 from src.core.results_utils import (
@@ -108,13 +112,6 @@ def parse_args():
     return args
 
 
-def aggregate_counts(train_ds, val_ds, test_ds, classes: list):
-    """Count examples per class for each split."""
-    return {
-        "train": count_examples_per_class(train_ds, classes),
-        "val": count_examples_per_class(val_ds, classes),
-        "test": count_examples_per_class(test_ds, classes),
-    }
 def derive_summary_metrics(metrics_payload=None):
     """Project reference-training outputs onto the baseline summary schema."""
     if metrics_payload is None:
@@ -167,24 +164,18 @@ def build_summary_row(dataset_name: str, model_name: str, status: str, metrics_p
     return row
 
 
-def save_experiment_artifacts(experiment_dir: Path, training_result: dict, metrics_payload: dict):
-    """Persist checkpoint metadata, logs and final metrics."""
-    save_json(experiment_dir / "training_history.json", training_result["history"])
-    write_csv(experiment_dir / "training_history.csv", training_result["history"])
-    save_json(experiment_dir / "final_metrics.json", metrics_payload)
-
-
 def load_existing_summary(metrics_path: Path):
-    """Load the flattened summary from an existing finished experiment."""
-    existing_metrics = load_json(metrics_path)
-    summary = build_summary_row(
-        dataset_name=existing_metrics["dataset"],
-        model_name=existing_metrics["model_name"],
-        status="completed",
-        metrics_payload=existing_metrics,
+    """Carga un resumen previo sin repetir la reconstruccion."""
+    return load_summary_from_metrics(
+        metrics_path,
+        lambda existing_metrics: build_summary_row(
+            dataset_name=existing_metrics["dataset"],
+            model_name=existing_metrics["model_name"],
+            status="completed",
+            metrics_payload=existing_metrics,
+        ),
+        status="skipped_existing",
     )
-    summary["status"] = "skipped_existing"
-    return summary
 
 
 def run_single_experiment(
@@ -243,7 +234,7 @@ def run_single_experiment(
         len(classes),
     )
 
-    split_counts = aggregate_counts(train_ds, val_ds, test_ds, classes)
+    split_counts = aggregate_split_counts(train_ds, val_ds, test_ds, classes)
     prediction_confidence_mean = evaluate_prediction_confidence(model, test_loader)
     metrics_payload = {
         "dataset": dataset_name,

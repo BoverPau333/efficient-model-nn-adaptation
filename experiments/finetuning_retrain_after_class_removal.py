@@ -1,7 +1,6 @@
-"""Class-removal experiment with frozen-head retraining or two-stage fine-tuning."""
+"""Experimento de eliminacion con fine-tuning en una o dos fases."""
 
 import argparse
-import copy
 import time
 import traceback
 from pathlib import Path
@@ -15,25 +14,35 @@ from src.adaptation.class_removal_experiment_utils import (
     select_training_subset,
     total_examples_from_split_counts,
 )
+from src.adaptation.finetuning_schedule_utils import (
+    resolve_finetuning_training_setup,
+    run_finetuning_schedule,
+)
+from src.core.experiment_utils import (
+    aggregate_split_counts,
+    load_reference_metrics,
+    load_summary_from_metrics,
+    save_experiment_artifacts,
+)
 from src.experiments_config.class_removal_baseline_config import (
     DEFAULT_DATASET,
 )
 from src.experiments_config.config import BATCH_SIZE, LR, NUM_WORKERS, RESULTS_DIR, SEED
 from src.dataset.loaders import DATASET_LOADERS
-from src.dataset.utils import count_examples_per_class, remove_class_and_remap
+from src.dataset.utils import remove_class_and_remap
 from src.metrics_elimination import METRICAS_ELIMINACION
 from src.models import IMAGENET_FROZEN_HEAD_MODEL_BUILDERS
 from src.core.results_utils import (
     build_loader,
+    compute_forgetting_from_reference,
     count_trainable_parameters,
     evaluate_prediction_confidence,
-    load_json,
     save_json,
     set_seed,
     slugify,
     write_csv,
 )
-from src.core.training import evaluate, train_with_early_stopping
+from src.core.training import evaluate
 
 
 DEFAULT_MAX_EPOCHS = 5
@@ -152,81 +161,6 @@ def parse_args():
         help="Percentage of the filtered training split to use for fine-tuning (0, 100].",
     )
     return parser.parse_args()
-def set_all_parameters_trainable(model):
-    """Unfreeze the entire model for full fine-tuning."""
-    for parameter in model.parameters():
-        parameter.requires_grad = True
-
-
-def resolve_training_setup(args):
-    """Describe the selected training regime."""
-    if args.two_stage_finetuning:
-        return {
-            "mode_label": "two_stage_finetuning",
-            "backbone_mode": "finetuned",
-            "trainable_scope": "head_then_full_model",
-            "train_percentage": float(args.porc),
-            "max_epochs": int(args.frozen_epochs + args.unfrozen_epochs),
-            "head_epochs": int(args.frozen_epochs),
-            "full_model_epochs": int(args.unfrozen_epochs),
-            "description": (
-                f"head-only for {args.frozen_epochs} epochs, then full-model "
-                f"fine-tuning for {args.unfrozen_epochs} epochs"
-            ),
-        }
-
-    return {
-        "mode_label": "head_only",
-        "backbone_mode": "frozen",
-        "trainable_scope": "head_only",
-        "train_percentage": float(args.porc),
-        "max_epochs": int(args.epochs),
-        "head_epochs": int(args.epochs),
-        "full_model_epochs": 0,
-        "description": f"head-only for {args.epochs} epochs",
-    }
-
-
-def load_reference_metrics(reference_dir: Path, dataset_name: str, model_name: str):
-    """Load the full-class ImageNet reference metrics for one dataset/model pair."""
-    metrics_path = reference_dir / slugify(dataset_name) / slugify(model_name) / "final_metrics.json"
-    if not metrics_path.exists():
-        raise FileNotFoundError(
-            "Missing full-training ImageNet reference metrics at "
-            f"'{metrics_path}'. Run experiments/full_training_reference_imagenet.py first "
-            "or pass --reference-dir with the correct location."
-        )
-
-    metrics_payload = load_json(metrics_path)
-    per_class_accuracy = metrics_payload.get("test_per_class_accuracy")
-    if not isinstance(per_class_accuracy, dict) or not per_class_accuracy:
-        raise ValueError(
-            f"Reference metrics at '{metrics_path}' do not contain a valid "
-            "'test_per_class_accuracy' mapping."
-        )
-    return metrics_payload, metrics_path
-
-
-def compute_forgetting_from_reference(reference_per_class_accuracy: dict, current_per_class_accuracy: dict) -> float:
-    """Average how much the remaining classes worsen versus the full-class reference."""
-    remaining_classes = list(current_per_class_accuracy)
-    if not remaining_classes:
-        raise ValueError("Cannot compute forgetting without remaining classes.")
-
-    missing_classes = [
-        class_name for class_name in remaining_classes if class_name not in reference_per_class_accuracy
-    ]
-    if missing_classes:
-        raise ValueError(
-            "The ImageNet reference is missing remaining classes required for forgetting: "
-            f"{missing_classes}"
-        )
-
-    degradations = [
-        float(reference_per_class_accuracy[class_name]) - float(current_per_class_accuracy[class_name])
-        for class_name in remaining_classes
-    ]
-    return float(np.mean(degradations))
 
 
 def build_summary_row(
@@ -281,19 +215,11 @@ def build_summary_row(
     return row
 
 
-def save_experiment_artifacts(experiment_dir: Path, training_result: dict, metrics_payload: dict):
-    """Persist logs and final metrics."""
-    save_json(experiment_dir / "training_history.json", training_result["history"])
-    write_csv(experiment_dir / "training_history.csv", training_result["history"])
-    save_json(experiment_dir / "final_metrics.json", metrics_payload)
-
-
 def load_existing_summary(metrics_path: Path):
-    """Load the flattened summary from an existing finished experiment."""
-    existing_metrics = load_json(metrics_path)
-    summary = existing_metrics.get("summary")
-    if summary is None:
-        summary = build_summary_row(
+    """Carga un resumen previo sin repetir la reconstruccion."""
+    return load_summary_from_metrics(
+        metrics_path,
+        lambda existing_metrics: build_summary_row(
             dataset_name=existing_metrics["dataset"],
             model_name=existing_metrics["model_name"],
             removed_class_name=existing_metrics["removed_class"],
@@ -306,99 +232,9 @@ def load_existing_summary(metrics_path: Path):
                 "train_percentage": existing_metrics.get("train_percentage", 100.0),
             },
             metrics_payload=existing_metrics,
-        )
-    summary["status"] = "skipped_existing"
-    return summary
-
-
-def aggregate_counts(train_ds, val_ds, test_ds, classes: list):
-    """Count examples per class for the filtered splits."""
-    return {
-        "train": count_examples_per_class(train_ds, classes),
-        "val": count_examples_per_class(val_ds, classes),
-        "test": count_examples_per_class(test_ds, classes),
-    }
-
-
-def run_training_schedule(model, train_loader, val_loader, args, verbose: bool):
-    """Train either head-only or with two-stage fine-tuning and merge the history."""
-    if not args.two_stage_finetuning:
-        result = train_with_early_stopping(
-            model,
-            train_loader,
-            val_loader,
-            epochs=args.epochs,
-            lr=args.lr,
-            patience=None,
-            checkpoint_path=None,
-            verbose=verbose,
-        )
-        history = []
-        for epoch_info in result["history"]:
-            tagged_epoch = dict(epoch_info)
-            tagged_epoch["phase"] = "head_only"
-            history.append(tagged_epoch)
-        result["history"] = history
-        return result
-
-    if verbose:
-        print(f"    Stage 1/2: training head only for {args.frozen_epochs} epochs.")
-    frozen_stage = train_with_early_stopping(
-        model,
-        train_loader,
-        val_loader,
-        epochs=args.frozen_epochs,
-        lr=args.lr,
-        patience=None,
-        checkpoint_path=None,
-        verbose=verbose,
+        ),
+        status="skipped_existing",
     )
-    frozen_stage_best_weights = copy.deepcopy(model.state_dict())
-
-    set_all_parameters_trainable(model)
-
-    if verbose:
-        print(f"    Stage 2/2: fine-tuning full model for {args.unfrozen_epochs} epochs.")
-    unfrozen_stage = train_with_early_stopping(
-        model,
-        train_loader,
-        val_loader,
-        epochs=args.unfrozen_epochs,
-        lr=args.lr,
-        patience=None,
-        checkpoint_path=None,
-        verbose=verbose,
-    )
-
-    combined_history = []
-    for epoch_info in frozen_stage["history"]:
-        tagged_epoch = dict(epoch_info)
-        tagged_epoch["phase"] = "head_only"
-        combined_history.append(tagged_epoch)
-
-    for epoch_info in unfrozen_stage["history"]:
-        tagged_epoch = dict(epoch_info)
-        tagged_epoch["epoch"] = int(tagged_epoch["epoch"]) + len(frozen_stage["history"])
-        tagged_epoch["phase"] = "full_model"
-        combined_history.append(tagged_epoch)
-
-    best_val_loss = frozen_stage["best_val_loss"]
-    best_val_accuracy = frozen_stage["best_val_accuracy"]
-    best_epoch = frozen_stage["best_epoch"]
-    if unfrozen_stage["best_val_loss"] < best_val_loss:
-        best_val_loss = unfrozen_stage["best_val_loss"]
-        best_val_accuracy = unfrozen_stage["best_val_accuracy"]
-        best_epoch = unfrozen_stage["best_epoch"] + len(frozen_stage["history"])
-    elif frozen_stage_best_weights is not None:
-        model.load_state_dict(frozen_stage_best_weights)
-
-    return {
-        "history": combined_history,
-        "best_epoch": int(best_epoch),
-        "best_val_loss": float(best_val_loss),
-        "best_val_accuracy": float(best_val_accuracy),
-        "epochs_ran": len(combined_history),
-    }
 
 
 def run_single_experiment(
@@ -435,8 +271,15 @@ def run_single_experiment(
         reference_dir=Path(args.reference_dir),
         dataset_name=dataset_name,
         model_name=model_name,
+        run_hint="experiments/full_training_reference_imagenet.py",
     )
-    training_setup = resolve_training_setup(args)
+    training_setup = resolve_finetuning_training_setup(
+        two_stage_finetuning=args.two_stage_finetuning,
+        train_percentage=args.porc,
+        head_only_epochs=args.epochs,
+        frozen_epochs=args.frozen_epochs,
+        unfrozen_epochs=args.unfrozen_epochs,
+    )
 
     set_seed(args.seed)
     sampled_train = select_training_subset(filtered_train, args.porc, args.seed)
@@ -462,11 +305,15 @@ def run_single_experiment(
     num_trainable_parameters_before = count_trainable_parameters(model)
 
     t0 = time.time()
-    training_result = run_training_schedule(
+    training_result = run_finetuning_schedule(
         model,
         train_loader,
         val_loader,
-        args=args,
+        two_stage_finetuning=args.two_stage_finetuning,
+        head_only_epochs=args.epochs,
+        frozen_epochs=args.frozen_epochs,
+        unfrozen_epochs=args.unfrozen_epochs,
+        lr=args.lr,
         verbose=True,
     )
     elapsed = time.time() - t0
@@ -478,7 +325,7 @@ def run_single_experiment(
         num_classes,
     )
 
-    split_counts = aggregate_counts(sampled_train, filtered_val, filtered_test, filtered_classes)
+    split_counts = aggregate_split_counts(sampled_train, filtered_val, filtered_test, filtered_classes)
     prediction_confidence_mean = evaluate_prediction_confidence(model, test_loader)
     test_per_class_accuracy = {
         class_name: float(per_class_accuracy[class_idx])
@@ -523,7 +370,7 @@ def run_single_experiment(
         "num_trainable_parameters_before_training": int(num_trainable_parameters_before),
         "additional_memory_required": 0.0,
         "full_filtered_train_examples": int(len(filtered_train)),
-        "forgetting_u_olvido": float(forgetting_value),
+        "forgetting_u_olvido": None if forgetting_value is None else float(forgetting_value),
         "forgetting_reference_source": "full_training_reference_imagenet",
         "forgetting_reference_metrics_path": str(reference_metrics_path),
         "metricas_eliminacion": [metrica.nombre for metrica in METRICAS_ELIMINACION],
@@ -555,8 +402,13 @@ def run_all_experiments(args):
     }
     all_summary_rows = []
     base_output_dir = Path(args.output_dir)
-    training_setup = resolve_training_setup(args)
-    training_setup["train_percentage"] = float(args.porc)
+    training_setup = resolve_finetuning_training_setup(
+        two_stage_finetuning=args.two_stage_finetuning,
+        train_percentage=args.porc,
+        head_only_epochs=args.epochs,
+        frozen_epochs=args.frozen_epochs,
+        unfrozen_epochs=args.unfrozen_epochs,
+    )
 
     print(f"Datasets selected: {dataset_names}")
     print(f"Models selected: {list(selected_models)}")

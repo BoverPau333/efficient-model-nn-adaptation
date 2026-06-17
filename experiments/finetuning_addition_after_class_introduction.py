@@ -1,4 +1,4 @@
-"""Class-addition experiment initialized from a 9-class reference checkpoint."""
+"""Experimento de adicion inicializado desde una referencia de 9 clases."""
 
 import argparse
 import sys
@@ -31,6 +31,13 @@ from src.adaptation.finetuning_schedule_utils import (
     resolve_finetuning_training_setup,
     run_finetuning_schedule,
 )
+from src.core.experiment_utils import (
+    aggregate_split_counts,
+    collect_dataset_summary_rows as collect_summary_rows_from_artifacts,
+    load_summary_from_metrics,
+    rebuild_summary_files as rebuild_summary_artifacts,
+    save_experiment_artifacts,
+)
 from src.core.results_utils import (
     add_output_class,
     build_loader,
@@ -45,7 +52,7 @@ from src.core.results_utils import (
 )
 from src.core.training import evaluate
 from src.dataset.loaders import DATASET_LOADERS
-from src.dataset.utils import count_examples_per_class, remove_class_and_remap, resolve_class_to_remove
+from src.dataset.utils import remove_class_and_remap, resolve_class_to_remove
 from src.experiments_config.class_to_add import DEFAULT_DATASET
 from src.experiments_config.config import BATCH_SIZE, DEVICE, LR, NUM_WORKERS, RESULTS_DIR, SEED
 from src.metrics_addition import METRICAS_ADICION
@@ -167,28 +174,11 @@ def parse_args():
     return parser.parse_args()
 
 
-def aggregate_counts(train_ds, val_ds, test_ds, classes: list):
-    """Count examples per class for each split."""
-    return {
-        "train": count_examples_per_class(train_ds, classes),
-        "val": count_examples_per_class(val_ds, classes),
-        "test": count_examples_per_class(test_ds, classes),
-    }
-
-
-def save_experiment_artifacts(experiment_dir: Path, training_result: dict, metrics_payload: dict):
-    """Persist logs and final metrics."""
-    save_json(experiment_dir / "training_history.json", training_result["history"])
-    write_csv(experiment_dir / "training_history.csv", training_result["history"])
-    save_json(experiment_dir / "final_metrics.json", metrics_payload)
-
-
 def load_existing_summary(metrics_path: Path):
-    """Load the flattened summary from an existing finished experiment."""
-    existing_metrics = load_json(metrics_path)
-    summary = existing_metrics.get("summary")
-    if summary is None:
-        summary = build_addition_finetuning_summary_row(
+    """Carga un resumen previo sin repetir la reconstruccion."""
+    return load_summary_from_metrics(
+        metrics_path,
+        lambda existing_metrics: build_addition_finetuning_summary_row(
             dataset_name=existing_metrics["dataset"],
             model_name=existing_metrics["model_name"],
             added_class_name=existing_metrics["added_class"],
@@ -201,9 +191,9 @@ def load_existing_summary(metrics_path: Path):
                 "train_percentage": existing_metrics.get("train_percentage", 100.0),
             },
             metrics_payload=existing_metrics,
-        )
-    summary["status"] = "skipped_existing"
-    return summary
+        ),
+        status="skipped_existing",
+    )
 
 
 def load_completed_summary(metrics_path: Path):
@@ -229,34 +219,12 @@ def load_completed_summary(metrics_path: Path):
 
 
 def collect_dataset_summary_rows(dataset_output_dir: Path):
-    """Rebuild one dataset summary by scanning persisted experiment artifacts."""
-    rows_by_key = {}
-
-    for metrics_path in sorted(dataset_output_dir.rglob("final_metrics.json")):
-        if not metrics_path.parent.name.startswith("added_"):
-            continue
-        summary = load_completed_summary(metrics_path)
-        key = (
-            summary.get("model_name"),
-            summary.get("training_mode"),
-            summary.get("train_percentage"),
-            summary.get("added_class"),
-        )
-        rows_by_key[key] = summary
-
-    for error_path in sorted(dataset_output_dir.rglob("error.json")):
-        if not error_path.parent.name.startswith("added_"):
-            continue
-        error_payload = load_json(error_path)
-        key = (
-            error_payload.get("model_name"),
-            error_payload.get("training_mode"),
-            error_payload.get("train_percentage"),
-            error_payload.get("added_class"),
-        )
-        if key in rows_by_key:
-            continue
-        rows_by_key[key] = build_addition_finetuning_summary_row(
+    """Reconstruye el resumen usando la utilidad comun."""
+    return collect_summary_rows_from_artifacts(
+        dataset_output_dir,
+        artifact_prefix="added_",
+        load_completed_summary=load_completed_summary,
+        build_error_summary=lambda error_payload: build_addition_finetuning_summary_row(
             dataset_name=error_payload["dataset"],
             model_name=error_payload["model_name"],
             added_class_name=error_payload["added_class"],
@@ -269,43 +237,23 @@ def collect_dataset_summary_rows(dataset_output_dir: Path):
                 "train_percentage": error_payload.get("train_percentage", 100.0),
             },
             error_message=error_payload.get("error"),
-        )
-
-    return [
-        rows_by_key[key]
-        for key in sorted(
-            rows_by_key,
-            key=lambda item: (
-                str(item[0] or ""),
-                str(item[1] or ""),
-                float(item[2] or 0.0),
-                str(item[3] or ""),
-            ),
-        )
-    ]
+        ),
+        build_row_key=lambda payload: (
+            payload.get("model_name"),
+            payload.get("training_mode"),
+            payload.get("train_percentage"),
+            payload.get("added_class"),
+        ),
+    )
 
 
 def rebuild_summary_files(base_output_dir: Path, dataset_names: list):
-    """Recompute dataset and global summaries from persisted experiment outputs."""
-    all_summary_rows = []
-    requested_dataset_dirs = {base_output_dir / slugify(dataset_name) for dataset_name in dataset_names}
-    existing_dataset_dirs = (
-        {path for path in base_output_dir.iterdir() if path.is_dir()}
-        if base_output_dir.exists()
-        else set()
+    """Reescribe los resumenes apoyandose en la utilidad comun."""
+    return rebuild_summary_artifacts(
+        base_output_dir,
+        dataset_names,
+        collect_dataset_rows=collect_dataset_summary_rows,
     )
-
-    for dataset_output_dir in sorted(requested_dataset_dirs | existing_dataset_dirs):
-        if not dataset_output_dir.exists():
-            continue
-        summary_rows = collect_dataset_summary_rows(dataset_output_dir)
-        save_json(dataset_output_dir / "experiments_summary.json", summary_rows)
-        write_csv(dataset_output_dir / "experiments_summary.csv", summary_rows)
-        all_summary_rows.extend(summary_rows)
-
-    save_json(base_output_dir / "all_experiments_summary.json", all_summary_rows)
-    write_csv(base_output_dir / "all_experiments_summary.csv", all_summary_rows)
-    return all_summary_rows
 
 
 def initialize_model_from_reference(
@@ -416,7 +364,7 @@ def run_single_experiment(
         test_loader,
         len(original_classes),
     )
-    split_counts = aggregate_counts(sampled_train, val_ds, test_ds, original_classes)
+    split_counts = aggregate_split_counts(sampled_train, val_ds, test_ds, original_classes)
     prediction_confidence_mean = evaluate_prediction_confidence(model, test_loader)
     test_per_class_accuracy = {
         class_name: float(per_class_accuracy[class_idx])
@@ -439,6 +387,14 @@ def run_single_experiment(
             class_idx=added_class_idx,
             build_loader_fn=build_loader,
             args=args,
+        )
+    )
+
+    previous_class_train_examples = int(
+        sum(
+            count
+            for class_name, count in split_counts["train"].items()
+            if class_name != str(added_class_name)
         )
     )
 
@@ -477,7 +433,8 @@ def run_single_experiment(
         "confusion_matrix": confusion_matrix.tolist(),
         "class_names": list(original_classes),
         "examples_per_split": split_counts,
-        "num_examples_used_for_adaptation": total_examples_from_split_counts(split_counts, "train"),
+        # Mantenemos este conteo alineado con la referencia de 9 clases.
+        "num_examples_used_for_adaptation": previous_class_train_examples,
         "num_examples_added_class_train": int(split_counts["train"].get(str(added_class_name), 0)),
         "prediction_confidence_mean": float(prediction_confidence_mean),
         "prediction_confidence_added_class_mean": float(prediction_confidence_added_class_mean),

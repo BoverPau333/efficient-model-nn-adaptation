@@ -1,6 +1,7 @@
-"""Baseline-style class-removal experiment with frozen ImageNet backbones."""
+"""Experimento de eliminacion con backbone ImageNet congelado."""
 
 import argparse
+import json
 import time
 import traceback
 from pathlib import Path
@@ -9,19 +10,25 @@ import numpy as np
 import torch
 
 from src.adaptation.class_removal_experiment_utils import get_classes_to_remove, total_examples_from_split_counts
+from src.core.experiment_utils import (
+    aggregate_split_counts,
+    load_reference_metrics,
+    load_summary_from_metrics,
+    save_experiment_artifacts,
+)
 from src.experiments_config.class_removal_baseline_config import (
     DEFAULT_DATASET,
 )
 from src.experiments_config.config import BATCH_SIZE, LR, NUM_WORKERS, RESULTS_DIR, SEED
 from src.dataset.loaders import DATASET_LOADERS
-from src.dataset.utils import count_examples_per_class, remove_class_and_remap
+from src.dataset.utils import remove_class_and_remap
 from src.metrics_elimination import METRICAS_ELIMINACION
 from src.models import IMAGENET_FROZEN_HEAD_MODEL_BUILDERS
 from src.core.results_utils import (
     build_loader,
+    compute_forgetting_from_reference,
     count_trainable_parameters,
     evaluate_prediction_confidence,
-    load_json,
     save_json,
     set_seed,
     slugify,
@@ -118,48 +125,6 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_reference_metrics(reference_dir: Path, dataset_name: str, model_name: str):
-    """Load the full-class ImageNet reference metrics for one dataset/model pair."""
-    metrics_path = reference_dir / slugify(dataset_name) / slugify(model_name) / "final_metrics.json"
-    if not metrics_path.exists():
-        raise FileNotFoundError(
-            "Missing full-training ImageNet reference metrics at "
-            f"'{metrics_path}'. Run experiments/full_training_reference_imagenet.py first "
-            "or pass --reference-dir with the correct location."
-        )
-
-    metrics_payload = load_json(metrics_path)
-    per_class_accuracy = metrics_payload.get("test_per_class_accuracy")
-    if not isinstance(per_class_accuracy, dict) or not per_class_accuracy:
-        raise ValueError(
-            f"Reference metrics at '{metrics_path}' do not contain a valid "
-            "'test_per_class_accuracy' mapping."
-        )
-    return metrics_payload, metrics_path
-
-
-def compute_forgetting_from_reference(reference_per_class_accuracy: dict, current_per_class_accuracy: dict) -> float:
-    """Average how much the remaining classes worsen versus the full-class reference."""
-    remaining_classes = list(current_per_class_accuracy)
-    if not remaining_classes:
-        raise ValueError("Cannot compute forgetting without remaining classes.")
-
-    missing_classes = [
-        class_name for class_name in remaining_classes if class_name not in reference_per_class_accuracy
-    ]
-    if missing_classes:
-        raise ValueError(
-            "The ImageNet reference is missing remaining classes required for forgetting: "
-            f"{missing_classes}"
-        )
-
-    degradations = [
-        float(reference_per_class_accuracy[class_name]) - float(current_per_class_accuracy[class_name])
-        for class_name in remaining_classes
-    ]
-    return float(np.mean(degradations))
-
-
 def build_summary_row(
     dataset_name: str,
     model_name: str,
@@ -209,37 +174,20 @@ def build_summary_row(
     return row
 
 
-def save_experiment_artifacts(experiment_dir: Path, training_result: dict, metrics_payload: dict):
-    """Persist logs and final metrics."""
-    save_json(experiment_dir / "training_history.json", training_result["history"])
-    write_csv(experiment_dir / "training_history.csv", training_result["history"])
-    save_json(experiment_dir / "final_metrics.json", metrics_payload)
-
-
 def load_existing_summary(metrics_path: Path):
-    """Load the flattened summary from an existing finished experiment."""
-    existing_metrics = load_json(metrics_path)
-    summary = existing_metrics.get("summary")
-    if summary is None:
-        summary = build_summary_row(
+    """Carga un resumen previo sin repetir la reconstruccion."""
+    return load_summary_from_metrics(
+        metrics_path,
+        lambda existing_metrics: build_summary_row(
             dataset_name=existing_metrics["dataset"],
             model_name=existing_metrics["model_name"],
             removed_class_name=existing_metrics["removed_class"],
             final_num_classes=existing_metrics["final_num_classes"],
             status="completed",
             metrics_payload=existing_metrics,
-        )
-    summary["status"] = "skipped_existing"
-    return summary
-
-
-def aggregate_counts(train_ds, val_ds, test_ds, classes: list):
-    """Count examples per class for the filtered splits."""
-    return {
-        "train": count_examples_per_class(train_ds, classes),
-        "val": count_examples_per_class(val_ds, classes),
-        "test": count_examples_per_class(test_ds, classes),
-    }
+        ),
+        status="skipped_existing",
+    )
 
 
 def run_single_experiment(
@@ -275,6 +223,7 @@ def run_single_experiment(
         reference_dir=Path(args.reference_dir),
         dataset_name=dataset_name,
         model_name=model_name,
+        run_hint="experiments/full_training_reference_imagenet.py",
     )
 
     set_seed(args.seed)
@@ -312,7 +261,7 @@ def run_single_experiment(
         num_classes,
     )
 
-    split_counts = aggregate_counts(filtered_train, filtered_val, filtered_test, filtered_classes)
+    split_counts = aggregate_split_counts(filtered_train, filtered_val, filtered_test, filtered_classes)
     prediction_confidence_mean = evaluate_prediction_confidence(model, test_loader)
     test_per_class_accuracy = {
         class_name: float(per_class_accuracy[class_idx])
@@ -351,7 +300,7 @@ def run_single_experiment(
         "prediction_confidence_mean": float(prediction_confidence_mean),
         "num_trainable_parameters": int(num_trainable_parameters),
         "additional_memory_required": 0.0,
-        "forgetting_u_olvido": float(forgetting_value),
+        "forgetting_u_olvido": None if forgetting_value is None else float(forgetting_value),
         "forgetting_reference_source": "full_training_reference_imagenet",
         "forgetting_reference_metrics_path": str(reference_metrics_path),
         "metricas_eliminacion": [metrica.nombre for metrica in METRICAS_ELIMINACION],
