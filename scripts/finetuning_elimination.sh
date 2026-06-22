@@ -16,14 +16,12 @@ PORCS=(50 20 10)
 "$ENV_PY" -V
 "$ENV_PY" -c "import torch; print(torch.__version__); print(torch.cuda.is_available())"
 
-for porc in "${PORCS[@]}"; do
-    echo "Running head-only fine-tuning with --porc ${porc}"
-    "$ENV_PY" -m experiments.finetuning_retrain_after_class_removal \
-        --all-datasets \
-        --overwrite \
-        --output-dir /mnt/homeGPU/pbovera/results/class_removal_frozen_backbone_head \
-        --porc "$porc"
-done
+echo "Running frozen-backbone head-only retraining on all datasets"
+"$ENV_PY" -m experiments.frozen_backbone_head_retrain_after_class_removal \
+    --all-datasets \
+    --overwrite \
+    --output-dir /mnt/homeGPU/pbovera/results/class_removal_frozen_backbone_head \
+    --reference-dir /mnt/homeGPU/pbovera/results/full_training_reference_imagenet
 
 for porc in "${PORCS[@]}"; do
     echo "Running two-stage fine-tuning with --porc ${porc}"

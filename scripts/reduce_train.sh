@@ -13,6 +13,6 @@ conda run -p "$ENV_PATH" python -c "import sys; print(sys.executable)"
 conda run -p "$ENV_PATH" python -V
 conda run -p "$ENV_PATH" python -c "import torch; print(torch.__version__); print(torch.cuda.is_available())"
 
-conda run -p "$ENV_PATH" python reduce_and_evaluate.py
+conda run -p "$ENV_PATH" python -m experiments.reduce_and_evaluate
 
 mail -s "tfg_train finalizado" pauboverfemenias@gmail.com <<< "reduce_and_evaluate.py ha terminado"
